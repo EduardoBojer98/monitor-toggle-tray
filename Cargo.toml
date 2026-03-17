@@ -1,0 +1,8 @@
+[package]
+name = "monitor-toggle-tray"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ksni = "0.2"
+notify-rust = "4"
