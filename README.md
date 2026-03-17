@@ -92,8 +92,13 @@ The script:
 - builds the app in release mode with `cargo build --release`
 - creates `~/.local/bin` if needed
 - creates `~/.local/share/applications` if needed
+- creates `~/.local/share/icons/hicolor/scalable/apps` if needed
+- stops a running tray instance before replacing the binary
 - installs the binary to `~/.local/bin/monitor-toggle-tray`
+- installs the app icon to `~/.local/share/icons/hicolor/scalable/apps/monitor-toggle-tray.svg`
 - installs a desktop launcher to `~/.local/share/applications/monitor-toggle-tray.desktop`
+- refreshes `~/.config/autostart/monitor-toggle-tray.desktop` when autostart is already enabled
+- restarts the tray app after install when it was already running
 - refreshes the desktop application database when `update-desktop-database` is available
 
 After installation you can launch it with:
@@ -144,6 +149,7 @@ The uninstall script removes these user-local files if they exist:
 
 - `~/.local/bin/monitor-toggle-tray`
 - `~/.local/share/applications/monitor-toggle-tray.desktop`
+- `~/.local/share/icons/hicolor/scalable/apps/monitor-toggle-tray.svg`
 - `~/.config/autostart/monitor-toggle-tray.desktop`
 
 It also refreshes the desktop application database when `update-desktop-database` is available.
