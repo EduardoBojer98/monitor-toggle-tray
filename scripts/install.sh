@@ -12,6 +12,8 @@ AUTOSTART_DIR="${HOME}/.config/autostart"
 BIN_PATH="${BIN_DIR}/${APP_ID}"
 DESKTOP_PATH="${APP_DIR}/${APP_ID}.desktop"
 ICON_PATH="${ICON_DIR}/${APP_ID}.svg"
+ICON_HDMI1_PATH="${ICON_DIR}/${APP_ID}-hdmi1.svg"
+ICON_HDMI2_PATH="${ICON_DIR}/${APP_ID}-hdmi2.svg"
 AUTOSTART_PATH="${AUTOSTART_DIR}/${APP_ID}.desktop"
 
 write_desktop_entry() {
@@ -56,6 +58,12 @@ install -m 755 "${PROJECT_DIR}/target/release/${APP_ID}" "${BIN_PATH}"
 
 echo "Installing app icon to ${ICON_PATH}..."
 install -m 644 "${PROJECT_DIR}/assets/${APP_ID}.svg" "${ICON_PATH}"
+
+echo "Installing HDMI 1 tray icon to ${ICON_HDMI1_PATH}..."
+install -m 644 "${PROJECT_DIR}/assets/${APP_ID}-hdmi1.svg" "${ICON_HDMI1_PATH}"
+
+echo "Installing HDMI 2 tray icon to ${ICON_HDMI2_PATH}..."
+install -m 644 "${PROJECT_DIR}/assets/${APP_ID}-hdmi2.svg" "${ICON_HDMI2_PATH}"
 
 echo "Installing desktop launcher to ${DESKTOP_PATH}..."
 write_desktop_entry "${DESKTOP_PATH}"

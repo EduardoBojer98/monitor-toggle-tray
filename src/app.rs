@@ -138,13 +138,23 @@ pub fn notify(summary: &str, body: &str) {
 }
 
 pub fn tray_icon_theme_path() -> String {
-    let icon_dir = app_icon_install_dir();
+    tray_icon_search_dir()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
 
-    if icon_dir.exists() {
-        icon_dir.to_string_lossy().into_owned()
-    } else {
-        String::new()
+pub fn tray_icon_name_for_input(input: Option<&str>) -> &'static str {
+    match input {
+        Some(HDMI1) => "monitor-toggle-tray-hdmi1",
+        Some(HDMI2) => "monitor-toggle-tray-hdmi2",
+        _ => APP_ID,
     }
+}
+
+pub fn tray_icon_uses_theme_assets(input: Option<&str>) -> bool {
+    tray_icon_search_dir()
+        .map(|dir| dir.join(format!("{}.svg", tray_icon_name_for_input(input))).exists())
+        .unwrap_or(false)
 }
 
 pub fn autostart_enabled() -> bool {
@@ -380,6 +390,34 @@ fn app_icon_install_dir() -> PathBuf {
 
 fn app_icon_install_path() -> PathBuf {
     app_icon_install_dir().join(format!("{APP_ID}.svg"))
+}
+
+fn bundled_icon_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets")
+}
+
+fn tray_icon_search_dir() -> Option<PathBuf> {
+    let installed_dir = app_icon_install_dir();
+    if tray_icon_set_exists(&installed_dir) {
+        return Some(installed_dir);
+    }
+
+    let bundled_dir = bundled_icon_dir();
+    if tray_icon_set_exists(&bundled_dir) {
+        return Some(bundled_dir);
+    }
+
+    None
+}
+
+fn tray_icon_set_exists(dir: &std::path::Path) -> bool {
+    [
+        format!("{APP_ID}.svg"),
+        format!("{APP_ID}-hdmi1.svg"),
+        format!("{APP_ID}-hdmi2.svg"),
+    ]
+    .into_iter()
+    .all(|name| dir.join(name).exists())
 }
 
 fn desktop_icon_value() -> String {

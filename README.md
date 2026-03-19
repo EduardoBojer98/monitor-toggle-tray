@@ -95,7 +95,8 @@ The script:
 - creates `~/.local/share/icons/hicolor/scalable/apps` if needed
 - stops a running tray instance before replacing the binary
 - installs the binary to `~/.local/bin/monitor-toggle-tray`
-- installs the app icon to `~/.local/share/icons/hicolor/scalable/apps/monitor-toggle-tray.svg`
+- installs the default app icon to `~/.local/share/icons/hicolor/scalable/apps/monitor-toggle-tray.svg`
+- installs tray state icons to `~/.local/share/icons/hicolor/scalable/apps/monitor-toggle-tray-hdmi1.svg` and `~/.local/share/icons/hicolor/scalable/apps/monitor-toggle-tray-hdmi2.svg`
 - installs a desktop launcher to `~/.local/share/applications/monitor-toggle-tray.desktop`
 - refreshes `~/.config/autostart/monitor-toggle-tray.desktop` when autostart is already enabled
 - restarts the tray app after install when it was already running
@@ -150,6 +151,8 @@ The uninstall script removes these user-local files if they exist:
 - `~/.local/bin/monitor-toggle-tray`
 - `~/.local/share/applications/monitor-toggle-tray.desktop`
 - `~/.local/share/icons/hicolor/scalable/apps/monitor-toggle-tray.svg`
+- `~/.local/share/icons/hicolor/scalable/apps/monitor-toggle-tray-hdmi1.svg`
+- `~/.local/share/icons/hicolor/scalable/apps/monitor-toggle-tray-hdmi2.svg`
 - `~/.config/autostart/monitor-toggle-tray.desktop`
 
 It also refreshes the desktop application database when `update-desktop-database` is available.

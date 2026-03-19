@@ -1,32 +1,32 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
-  <title id="title">Monitor Toggle icon</title>
-  <desc id="desc">A stylized monitor on a rounded square with a toggle badge.</desc>
+  <title id="title">Monitor Toggle default tray icon</title>
+  <desc id="desc">A neutral modern monitor icon used when the active input is unknown.</desc>
   <defs>
-    <linearGradient id="bg" x1="32" y1="24" x2="224" y2="232" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#0f766e"/>
-      <stop offset="1" stop-color="#155e75"/>
+    <linearGradient id="shell" x1="56" y1="48" x2="200" y2="184" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#334155"/>
+      <stop offset="1" stop-color="#0f172a"/>
     </linearGradient>
-    <linearGradient id="screen" x1="72" y1="68" x2="184" y2="156" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#0f172a"/>
-      <stop offset="1" stop-color="#164e63"/>
+    <linearGradient id="screen" x1="72" y1="64" x2="184" y2="156" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#334155"/>
+      <stop offset="1" stop-color="#1e293b"/>
     </linearGradient>
-    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
-      <feDropShadow dx="0" dy="10" stdDeviation="10" flood-color="#082f49" flood-opacity="0.28"/>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#020617" flood-opacity="0.28"/>
     </filter>
   </defs>
 
-  <rect x="20" y="20" width="216" height="216" rx="52" fill="url(#bg)"/>
-
   <g filter="url(#shadow)">
-    <rect x="54" y="60" width="148" height="96" rx="18" fill="#f8fafc"/>
-    <rect x="64" y="70" width="128" height="76" rx="12" fill="url(#screen)"/>
-    <path d="M118 156h20v22h-20z" fill="#f8fafc"/>
-    <rect x="94" y="178" width="68" height="10" rx="5" fill="#f8fafc"/>
+    <rect x="48" y="48" width="160" height="104" rx="28" fill="url(#shell)"/>
+    <rect x="60" y="60" width="136" height="80" rx="20" fill="url(#screen)"/>
+    <rect x="74" y="74" width="78" height="8" rx="4" fill="#94a3b8" opacity="0.9"/>
+    <rect x="80" y="102" width="96" height="12" rx="6" fill="#cbd5e1" opacity="0.7"/>
+    <rect x="118" y="150" width="20" height="28" rx="10" fill="#475569"/>
+    <rect x="90" y="176" width="76" height="12" rx="6" fill="#94a3b8"/>
   </g>
 
-  <g transform="translate(154 148)">
-    <rect x="0" y="0" width="58" height="58" rx="18" fill="#99f6e4"/>
-    <path d="M31 13v32" stroke="#0f172a" stroke-width="8" stroke-linecap="round"/>
-    <path d="M23 21l8-8 8 8" fill="none" stroke="#0f172a" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  <g transform="translate(154 142)" filter="url(#shadow)">
+    <circle cx="38" cy="38" r="32" fill="#e2e8f0"/>
+    <circle cx="38" cy="38" r="24" fill="#cbd5e1"/>
+    <circle cx="38" cy="38" r="8" fill="#0f172a"/>
   </g>
 </svg>

@@ -1,6 +1,7 @@
 use crate::app::{
     APP_ID, APP_NAME, HDMI1, HDMI2, InputCache, QuitSignal, SwitchTarget, autostart_enabled,
-    input_label, notify, select_target, set_autostart, tray_icon_theme_path,
+    input_label, notify, select_target, set_autostart, tray_icon_name_for_input,
+    tray_icon_theme_path, tray_icon_uses_theme_assets,
 };
 use crate::icon::monitor_tray_icon;
 use ksni::{Icon, Tray, menu};
@@ -67,11 +68,15 @@ impl Tray for MonitorTray {
     }
 
     fn icon_name(&self) -> String {
-        APP_ID.into()
+        tray_icon_name_for_input(self.current_input().as_deref()).into()
     }
 
     fn icon_pixmap(&self) -> Vec<Icon> {
         let current_input = self.current_input();
+
+        if tray_icon_uses_theme_assets(current_input.as_deref()) {
+            return Vec::new();
+        }
 
         [16, 24, 32, 48]
             .into_iter()
