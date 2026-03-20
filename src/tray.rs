@@ -1,10 +1,9 @@
 use crate::app::{
     APP_ID, APP_NAME, HDMI1, HDMI2, InputCache, QuitSignal, SwitchTarget, autostart_enabled,
-    input_label, notify, select_target, set_autostart, tray_icon_name_for_input,
-    tray_icon_theme_path, tray_icon_uses_theme_assets,
+    input_label, notify, select_target, set_autostart, tray_icon_available, tray_icon_name,
+    tray_icon_theme_path,
 };
-use crate::icon::monitor_tray_icon;
-use ksni::{Icon, Tray, menu};
+use ksni::{ToolTip, Tray, menu};
 use std::sync::mpsc::Sender;
 
 pub struct MonitorTray {
@@ -68,26 +67,32 @@ impl Tray for MonitorTray {
     }
 
     fn icon_name(&self) -> String {
-        tray_icon_name_for_input(self.current_input().as_deref()).into()
-    }
-
-    fn icon_pixmap(&self) -> Vec<Icon> {
-        let current_input = self.current_input();
-
-        if tray_icon_uses_theme_assets(current_input.as_deref()) {
-            return Vec::new();
-        }
-
-        [16, 24, 32, 48]
-            .into_iter()
-            .map(|size| monitor_tray_icon(current_input.as_deref(), size))
-            .collect()
+        tray_icon_name().into()
     }
 
     fn title(&self) -> String {
-        self.current_input()
-            .map(|current| format!("{APP_NAME} ({})", input_label(&current)))
-            .unwrap_or_else(|| APP_NAME.into())
+        APP_NAME.into()
+    }
+
+    fn tool_tip(&self) -> ToolTip {
+        let current_input = self.current_input();
+        let current_label = current_input
+            .as_deref()
+            .map(input_label)
+            .unwrap_or("Unavailable");
+
+        ToolTip {
+            icon_name: if tray_icon_available() {
+                tray_icon_name().into()
+            } else {
+                String::new()
+            },
+            title: APP_NAME.into(),
+            description: format!(
+                "Current input: {current_label}\nLeft click switches between HDMI 1 and HDMI 2."
+            ),
+            ..Default::default()
+        }
     }
 
     fn activate(&mut self, _x: i32, _y: i32) {
