@@ -9,6 +9,8 @@ BIN_DIR="${HOME}/.local/bin"
 APP_DIR="${HOME}/.local/share/applications"
 ICON_DIR="${HOME}/.local/share/icons/hicolor/scalable/apps"
 AUTOSTART_DIR="${HOME}/.config/autostart"
+CONFIG_DIR="${HOME}/.config/${APP_ID}"
+STATE_DIR="${HOME}/.local/state/${APP_ID}"
 BIN_PATH="${BIN_DIR}/${APP_ID}"
 DESKTOP_PATH="${APP_DIR}/${APP_ID}.desktop"
 ICON_PATH="${ICON_DIR}/${APP_ID}.svg"
@@ -38,7 +40,7 @@ EOF
     fi
 }
 
-mkdir -p "${BIN_DIR}" "${APP_DIR}" "${ICON_DIR}" "${AUTOSTART_DIR}"
+mkdir -p "${BIN_DIR}" "${APP_DIR}" "${ICON_DIR}" "${AUTOSTART_DIR}" "${CONFIG_DIR}" "${STATE_DIR}"
 
 WAS_RUNNING="false"
 if pgrep -x "${APP_ID}" >/dev/null 2>&1; then

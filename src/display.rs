@@ -1,20 +1,12 @@
-use crate::app::{SwitchTarget, log_event, run_command, strip_ansi_escape_sequences, target_label};
+use crate::app::{log_event, run_command, strip_ansi_escape_sequences};
+use std::collections::BTreeMap;
 use std::env;
 use std::time::Duration;
 
-const HDMI1_LAYOUT_ATTEMPTS: usize = 10;
-const HDMI1_LAYOUT_RETRY_DELAY: Duration = Duration::from_millis(700);
-const HDMI2_LAYOUT_ATTEMPTS: usize = 10;
-const HDMI2_LAYOUT_RETRY_DELAY: Duration = Duration::from_millis(700);
-const HDMI2_LAYOUT_STABILITY_CHECKS: usize = 4;
-const SAVED_HDMI1_EXTERNAL_NAME: &str = "HDMI-A-1";
-const SAVED_HDMI1_EXTERNAL_X: u32 = 0;
-const SAVED_HDMI1_EXTERNAL_Y: u32 = 0;
-const SAVED_HDMI1_INTERNAL_NAME: &str = "eDP-1";
-const SAVED_HDMI1_INTERNAL_X: u32 = 459;
-const SAVED_HDMI1_INTERNAL_Y: u32 = 1440;
 const MODE_RESOLVE_ATTEMPTS: usize = 5;
 const MODE_RESOLVE_RETRY_DELAY: Duration = Duration::from_millis(250);
+const OUTPUT_REAPPEAR_ATTEMPTS: usize = 12;
+const OUTPUT_REAPPEAR_RETRY_DELAY: Duration = Duration::from_millis(400);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DisplayBackend {
@@ -22,53 +14,416 @@ pub enum DisplayBackend {
     Xrandr,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DisplayOutput {
     pub id: String,
     pub name: String,
     pub connected: bool,
     pub internal: bool,
     pub current_mode: Option<(u32, u32)>,
+    pub position: Option<(i32, i32)>,
+    pub scale: Option<f32>,
 }
 
-#[derive(Clone)]
-struct DisplayPair {
-    anchor: DisplayOutput,
-    external: DisplayOutput,
+#[derive(Clone, Debug)]
+pub struct OutputLayout {
+    pub name: String,
+    pub position: Option<(i32, i32)>,
+    pub size: Option<(u32, u32)>,
 }
 
-pub fn prepare_display_layout(target: SwitchTarget) -> Result<(), String> {
+pub fn discover_outputs() -> Result<(DisplayBackend, Vec<DisplayOutput>), String> {
     let backends = available_display_backends();
-    if backends.is_empty() {
-        return Err("No supported display management tool was found.".to_string());
-    }
-
     let mut last_error = "No supported display management tool was found.".to_string();
+    let mut discovered = Vec::new();
 
     for backend in backends {
-        log_event(format!(
-            "prepare_display_layout: target={} trying backend={backend:?}",
-            target_label(target)
-        ));
-
-        let result = match target {
-            SwitchTarget::Hdmi1 => prepare_hdmi1_layout(backend),
-            SwitchTarget::Hdmi2 => prepare_hdmi2_layout(backend),
-        };
-
-        match result {
-            Ok(()) => return Ok(()),
+        match list_outputs(backend) {
+            Ok(outputs) if !outputs.is_empty() => discovered.push((backend, outputs)),
+            Ok(_) => last_error = "No display outputs were detected.".into(),
             Err(err) => {
-                log_event(format!(
-                    "prepare_display_layout: target={} backend={backend:?} failed: {err}",
-                    target_label(target)
-                ));
+                log_event(format!("discover_outputs: backend={backend:?} failed: {err}"));
                 last_error = err;
             }
         }
     }
 
+    if let Some((preferred_backend, preferred_outputs)) = discovered.first().cloned() {
+        let merged_outputs = discovered
+            .iter()
+            .find(|(backend, _)| *backend == DisplayBackend::Xrandr)
+            .map(|(_, outputs)| merge_output_data(preferred_outputs.clone(), outputs))
+            .unwrap_or(preferred_outputs);
+
+        log_event(format!(
+            "discover_outputs: selected backend={preferred_backend:?} outputs=[{}]",
+            describe_outputs(&merged_outputs)
+        ));
+        return Ok((preferred_backend, merged_outputs));
+    }
+
     Err(last_error)
+}
+
+pub fn disable_outputs(primary_output: &str, outputs_to_disable: &[String]) -> Result<(), String> {
+    let (backend, outputs) = discover_outputs()?;
+    let primary = find_output(&outputs, primary_output)
+        .ok_or_else(|| format!("Primary display {primary_output} is no longer available."))?;
+
+    let targets = outputs
+        .iter()
+        .filter(|output| outputs_to_disable.iter().any(|name| name == &output.name))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    log_event(format!(
+        "disable_outputs: backend={backend:?} primary={} targets={}",
+        primary.name,
+        targets
+            .iter()
+            .map(|output| output.name.clone())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+
+    match backend {
+        DisplayBackend::KscreenDoctor => {
+            let mut args = vec![
+                format!("output.{}.enable", primary.id),
+                format!("output.{}.primary", primary.id),
+            ];
+
+            for output in targets.iter().filter(|output| output.name != primary.name) {
+                args.push(format!("output.{}.disable", output.id));
+            }
+
+            run_command("kscreen-doctor", &args).map(|_| ())
+        }
+        DisplayBackend::Xrandr => {
+            let mut args = vec![
+                "--output".into(),
+                primary.name.clone(),
+                "--auto".into(),
+                "--primary".into(),
+            ];
+
+            for output in targets.iter().filter(|output| output.name != primary.name) {
+                args.push("--output".into());
+                args.push(output.name.clone());
+                args.push("--off".into());
+            }
+
+            run_command("xrandr", &args).map(|_| ())
+        }
+    }
+}
+
+pub fn enable_outputs(
+    primary_output: &str,
+    primary_position: Option<(i32, i32)>,
+    outputs_to_enable: &[OutputLayout],
+) -> Result<(), String> {
+    let (backend, outputs) = discover_outputs()?;
+    let primary = find_output(&outputs, primary_output)
+        .ok_or_else(|| format!("Primary display {primary_output} is no longer available."))?;
+    let requested_targets = outputs_to_enable
+        .iter()
+        .filter(|layout| layout.name != primary_output)
+        .map(|layout| layout.name.clone())
+        .collect::<Vec<_>>();
+    let mut ordered_targets = resolve_enable_targets(primary_output, &requested_targets)?;
+    let positions_by_name = outputs_to_enable
+        .iter()
+        .map(|layout| (layout.name.clone(), layout.position))
+        .collect::<BTreeMap<_, _>>();
+    let sizes_by_name = outputs_to_enable
+        .iter()
+        .map(|layout| (layout.name.clone(), layout.size))
+        .collect::<BTreeMap<_, _>>();
+
+    for target in &mut ordered_targets {
+        if let Some(position) = positions_by_name.get(&target.name).copied().flatten() {
+            target.position = Some(position);
+        }
+        if let Some(size) = sizes_by_name.get(&target.name).copied().flatten() {
+            target.current_mode = Some(size);
+        }
+    }
+
+    let adjusted_primary_position =
+        normalize_stacked_primary_position(primary_output, primary_position, &ordered_targets);
+
+    ordered_targets.sort_by(|left, right| left.name.cmp(&right.name));
+
+    log_event(format!(
+        "enable_outputs: backend={backend:?} primary={} targets={}",
+        primary.name,
+        ordered_targets
+            .iter()
+            .map(|output| output.name.clone())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+
+    match backend {
+        DisplayBackend::KscreenDoctor => {
+            enable_outputs_kscreen_doctor(&primary, adjusted_primary_position, ordered_targets)
+        }
+        DisplayBackend::Xrandr => {
+            enable_outputs_xrandr(&primary, adjusted_primary_position, ordered_targets)
+        }
+    }
+}
+
+fn normalize_stacked_primary_position(
+    primary_output: &str,
+    primary_position: Option<(i32, i32)>,
+    outputs_to_enable: &[DisplayOutput],
+) -> Option<(i32, i32)> {
+    let Some((primary_x, primary_y)) = primary_position else {
+        return primary_position;
+    };
+
+    let topmost = outputs_to_enable
+        .iter()
+        .filter_map(|output| {
+            output
+                .position
+                .zip(output.current_mode)
+                .map(|((x, y), (width, height))| (output.name.as_str(), x, y, width, height))
+        })
+        .min_by_key(|(_, _, y, _, _)| *y);
+
+    let Some((top_name, top_x, top_y, top_width, top_height)) = topmost else {
+        return primary_position;
+    };
+
+    if primary_output == top_name || primary_y <= top_y {
+        return primary_position;
+    }
+
+    let touches_vertically = (primary_y - top_y).abs() <= (top_height as i32 + 400);
+    let overlaps_horizontally = primary_x < top_x + top_width as i32;
+
+    if !touches_vertically || !overlaps_horizontally {
+        return primary_position;
+    }
+
+    let adjusted_y = top_y + top_height as i32;
+    Some((primary_x, adjusted_y))
+}
+
+fn resolve_enable_targets(
+    primary_output: &str,
+    requested_targets: &[String],
+) -> Result<Vec<DisplayOutput>, String> {
+    if requested_targets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut last_seen = Vec::new();
+
+    for attempt in 0..OUTPUT_REAPPEAR_ATTEMPTS {
+        let (_, outputs) = discover_outputs()?;
+        let primary_available = outputs.iter().any(|output| output.name == primary_output);
+        let resolved_targets = requested_targets
+            .iter()
+            .filter_map(|name| find_output(&outputs, name))
+            .collect::<Vec<_>>();
+
+        last_seen = outputs;
+
+        if primary_available && resolved_targets.len() == requested_targets.len() {
+            log_event(format!(
+                "resolve_enable_targets: all targets available after attempt={} targets={}",
+                attempt + 1,
+                resolved_targets
+                    .iter()
+                    .map(|output| format!("{}(connected={})", output.name, output.connected))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            return Ok(resolved_targets);
+        }
+
+        if attempt + 1 < OUTPUT_REAPPEAR_ATTEMPTS {
+            std::thread::sleep(OUTPUT_REAPPEAR_RETRY_DELAY);
+        }
+    }
+
+    let missing = requested_targets
+        .iter()
+        .filter(|name| !last_seen.iter().any(|output| &output.name == *name))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    log_event(format!(
+        "resolve_enable_targets: missing targets after retries requested={} seen=[{}]",
+        requested_targets.join(", "),
+        describe_outputs(&last_seen)
+    ));
+
+    Err(if missing.is_empty() {
+        "Requested outputs never became available for re-enabling.".into()
+    } else {
+        format!(
+            "Requested outputs did not reappear in time: {}",
+            missing.join(", ")
+        )
+    })
+}
+
+fn enable_outputs_kscreen_doctor(
+    primary: &DisplayOutput,
+    primary_position: Option<(i32, i32)>,
+    outputs_to_enable: Vec<DisplayOutput>,
+) -> Result<(), String> {
+    let mut cursor_x = current_desktop_right_edge()?.max(0);
+    let mut args = Vec::new();
+    for output in outputs_to_enable {
+        let position = output.position.unwrap_or((cursor_x, 0));
+        args.push(format!("output.{}.enable", output.id));
+        args.push(format!(
+            "output.{}.position.{},{}",
+            output.id, position.0, position.1
+        ));
+
+        if output.position.is_none() {
+            if let Some(width) = resolve_output_mode_width(&output.name)? {
+                cursor_x += width as i32;
+            }
+        }
+    }
+
+    args.push(format!("output.{}.enable", primary.id));
+    args.push(format!("output.{}.primary", primary.id));
+    if let Some((x, y)) = primary_position {
+        args.push(format!("output.{}.position.{x},{y}", primary.id));
+    }
+
+    run_command("kscreen-doctor", &args)?;
+
+    Ok(())
+}
+
+fn enable_outputs_xrandr(
+    primary: &DisplayOutput,
+    primary_position: Option<(i32, i32)>,
+    outputs_to_enable: Vec<DisplayOutput>,
+) -> Result<(), String> {
+    let mut primary_args = vec![
+        "--output".into(),
+        primary.name.clone(),
+        "--auto".into(),
+        "--primary".into(),
+    ];
+    if let Some((x, y)) = primary_position {
+        primary_args.push("--pos".into());
+        primary_args.push(format!("{x}x{y}"));
+    }
+    run_command("xrandr", &primary_args)?;
+
+    let mut cursor_x = current_desktop_right_edge()?.max(0);
+
+    for output in outputs_to_enable {
+        let position = output.position.unwrap_or((cursor_x, 0));
+        let args = vec![
+            "--output".into(),
+            output.name.clone(),
+            "--auto".into(),
+            "--pos".into(),
+            format!("{}x{}", position.0, position.1),
+        ];
+        run_command("xrandr", &args)?;
+
+        if output.position.is_none() {
+            if let Some(width) = resolve_output_mode_width(&output.name)? {
+                cursor_x += width as i32;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn current_desktop_right_edge() -> Result<i32, String> {
+    let (_, outputs) = discover_outputs()?;
+    let right_edge = outputs
+        .iter()
+        .filter(|output| output.connected && output.current_mode.is_some())
+        .map(|output| {
+            let x = output.position.map(|(x, _)| x).unwrap_or(0);
+            let width = output.current_mode.map(|(width, _)| width as i32).unwrap_or(0);
+            x + width
+        })
+        .max()
+        .unwrap_or(0);
+
+    Ok(right_edge)
+}
+
+fn find_output(outputs: &[DisplayOutput], output_name: &str) -> Option<DisplayOutput> {
+    outputs
+        .iter()
+        .find(|output| output.name == output_name)
+        .cloned()
+}
+
+fn resolve_output_mode_width(output_name: &str) -> Result<Option<u32>, String> {
+    for attempt in 0..MODE_RESOLVE_ATTEMPTS {
+        let (_, outputs) = discover_outputs()?;
+        if let Some(width) = outputs
+            .iter()
+            .find(|output| output.name == output_name)
+            .and_then(|output| output.current_mode.map(|(width, _)| width))
+        {
+            return Ok(Some(width));
+        }
+
+        if attempt + 1 < MODE_RESOLVE_ATTEMPTS {
+            std::thread::sleep(MODE_RESOLVE_RETRY_DELAY);
+        }
+    }
+
+    Ok(None)
+}
+
+fn merge_output_data(
+    preferred_outputs: Vec<DisplayOutput>,
+    fallback_outputs: &[DisplayOutput],
+) -> Vec<DisplayOutput> {
+    let mut merged = preferred_outputs;
+    let fallback_by_name = fallback_outputs
+        .iter()
+        .map(|output| (output.name.clone(), output.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    for output in &mut merged {
+        let Some(fallback) = fallback_by_name.get(&output.name) else {
+            continue;
+        };
+
+        output.connected |= fallback.connected;
+        output.internal |= fallback.internal;
+        if output.current_mode.is_none() {
+            output.current_mode = fallback.current_mode;
+        }
+        if output.position.is_none() {
+            output.position = fallback.position;
+        }
+    }
+
+    for fallback in fallback_outputs {
+        if merged.iter().any(|output| output.name == fallback.name) {
+            continue;
+        }
+
+        if fallback.connected || fallback.internal {
+            merged.push(fallback.clone());
+        }
+    }
+
+    merged
 }
 
 fn display_backend_candidates(session: &str) -> [DisplayBackend; 2] {
@@ -98,7 +453,7 @@ fn describe_outputs(outputs: &[DisplayOutput]) -> String {
         .iter()
         .map(|output| {
             format!(
-                "{}(id={}, connected={}, internal={}, mode={})",
+                "{}(id={}, connected={}, internal={}, mode={}, scale={})",
                 output.name,
                 output.id,
                 output.connected,
@@ -106,7 +461,11 @@ fn describe_outputs(outputs: &[DisplayOutput]) -> String {
                 output
                     .current_mode
                     .map(|(width, height)| format!("{width}x{height}"))
-                    .unwrap_or_else(|| "none".into())
+                    .unwrap_or_else(|| "none".into()),
+                output
+                    .scale
+                    .map(|scale| format!("{scale:.2}"))
+                    .unwrap_or_else(|| "n/a".into())
             )
         })
         .collect::<Vec<_>>()
@@ -129,135 +488,15 @@ fn has_internal_marker(text: &str) -> bool {
         .any(|marker| normalized.contains(marker))
 }
 
-fn is_external_output(name: &str) -> bool {
-    let normalized = name.to_ascii_lowercase();
-
-    ["hdmi", "displayport", "dp-", "dvi", "vga"]
-        .iter()
-        .any(|marker| normalized.starts_with(marker) || normalized.contains(marker))
-}
-
-fn find_internal_output(outputs: &[DisplayOutput]) -> Option<DisplayOutput> {
-    outputs
-        .iter()
-        .find(|output| output.internal && output.connected)
-        .cloned()
-        .or_else(|| outputs.iter().find(|output| output.internal).cloned())
-        .or_else(|| {
-            outputs
-                .iter()
-                .find(|output| output.connected && !is_external_output(&output.name))
-                .cloned()
-        })
-        .or_else(|| {
-            // Some sessions expose the laptop panel with an odd connector name.
-            // If there is exactly one connected output that does not look external,
-            // treat it as the internal panel.
-            let connected_outputs = outputs
-                .iter()
-                .filter(|output| output.connected)
-                .cloned()
-                .collect::<Vec<_>>();
-
-            let non_external_outputs = connected_outputs
-                .into_iter()
-                .filter(|output| !is_external_output(&output.name))
-                .collect::<Vec<_>>();
-
-            if non_external_outputs.len() == 1 {
-                non_external_outputs.into_iter().next()
-            } else {
-                None
-            }
-        })
-}
-
-fn find_anchor_output(outputs: &[DisplayOutput]) -> Option<DisplayOutput> {
-    find_internal_output(outputs)
-        .or_else(|| outputs.iter().find(|output| output.connected).cloned())
-}
-
-fn find_external_output(outputs: &[DisplayOutput]) -> Option<DisplayOutput> {
-    outputs
-        .iter()
-        .find(|output| output.connected && !output.internal && is_external_output(&output.name))
-        .cloned()
-}
-
-fn find_known_external_output(outputs: &[DisplayOutput]) -> Option<DisplayOutput> {
-    outputs
-        .iter()
-        .find(|output| !output.internal && is_external_output(&output.name))
-        .cloned()
-}
-
-fn has_connected_external_output(outputs: &[DisplayOutput]) -> bool {
-    outputs.iter().any(|output| {
-        output.connected
-            && !output.internal
-            && is_external_output(&output.name)
-            && output.current_mode.is_some()
-    })
-}
-
-fn parse_output_mode(token: &str) -> Option<(u32, u32)> {
-    let geometry = token
-        .split_once('+')
-        .map(|(value, _)| value)
-        .unwrap_or(token);
+fn parse_geometry(token: &str) -> Option<((u32, u32), (i32, i32))> {
+    let (geometry, position) = token.split_once('+')?;
     let (width, height) = geometry.split_once('x')?;
+    let (x, y) = position.split_once('+')?;
 
-    Some((width.parse().ok()?, height.parse().ok()?))
-}
-
-fn resolve_output_mode(output: &DisplayOutput) -> Option<(u32, u32)> {
-    output.current_mode.or_else(|| {
-        list_outputs(DisplayBackend::Xrandr)
-            .ok()
-            .and_then(|outputs| {
-                outputs
-                    .iter()
-                    .find(|candidate| candidate.name == output.name)
-                    .and_then(|candidate| candidate.current_mode)
-                    .or_else(|| {
-                        if output.internal {
-                            outputs
-                                .iter()
-                                .find(|candidate| candidate.internal)
-                                .and_then(|candidate| candidate.current_mode)
-                        } else {
-                            None
-                        }
-                    })
-            })
-    })
-}
-
-fn resolve_output_mode_with_retries(output: &DisplayOutput) -> Option<(u32, u32)> {
-    for attempt in 0..MODE_RESOLVE_ATTEMPTS {
-        if let Some(mode) = resolve_output_mode(output) {
-            return Some(mode);
-        }
-
-        if attempt + 1 < MODE_RESOLVE_ATTEMPTS {
-            std::thread::sleep(MODE_RESOLVE_RETRY_DELAY);
-        }
-    }
-
-    None
-}
-
-fn saved_hdmi1_layout_positions(pair: &DisplayPair) -> Option<((u32, u32), (u32, u32))> {
-    if pair.anchor.name == SAVED_HDMI1_INTERNAL_NAME
-        && pair.external.name == SAVED_HDMI1_EXTERNAL_NAME
-    {
-        Some((
-            (SAVED_HDMI1_EXTERNAL_X, SAVED_HDMI1_EXTERNAL_Y),
-            (SAVED_HDMI1_INTERNAL_X, SAVED_HDMI1_INTERNAL_Y),
-        ))
-    } else {
-        None
-    }
+    Some((
+        (width.parse().ok()?, height.parse().ok()?),
+        (x.parse().ok()?, y.parse().ok()?),
+    ))
 }
 
 fn parse_kscreen_outputs(output: &str) -> Vec<DisplayOutput> {
@@ -283,21 +522,28 @@ fn parse_kscreen_outputs(output: &str) -> Vec<DisplayOutput> {
                 .get(output_index + 2)?
                 .trim_end_matches(':')
                 .to_string();
-            let current_mode = parts.iter().find_map(|part| parse_output_mode(part));
+            let geometry = parts.iter().find_map(|part| parse_geometry(part));
+            let scale = parse_kscreen_scale(trimmed);
             let connected = if trimmed.contains(" disconnected") {
                 false
             } else if trimmed.contains(" connected") || trimmed.contains(" enabled") {
                 true
             } else {
-                current_mode.is_some()
+                geometry.is_some()
             };
+            let current_mode = geometry.map(|(mode, _)| mode);
+            let position = geometry.map(|(_, position)| position);
+            let normalized_mode = normalize_geometry_mode(current_mode, scale);
+            let normalized_position = normalize_geometry_position(position, scale);
 
             Some(DisplayOutput {
                 id,
                 internal: is_internal_output(&name) || has_internal_marker(trimmed),
                 connected,
                 name,
-                current_mode,
+                current_mode: normalized_mode,
+                position: normalized_position,
+                scale,
             })
         })
         .collect()
@@ -312,21 +558,65 @@ fn parse_xrandr_outputs(output: &str) -> Vec<DisplayOutput> {
                 return None;
             }
 
-            let mut parts = trimmed.split_whitespace();
-            let name = parts.next()?.to_string();
-            let state = parts.next()?;
-            let connected = state == "connected";
-            let current_mode = parts.find_map(parse_output_mode);
+            let parts = trimmed.split_whitespace().collect::<Vec<_>>();
+            let name = parts.first()?.to_string();
+            let connected = parts.get(1).copied() == Some("connected");
+            let geometry = parts.iter().find_map(|part| parse_geometry(part));
 
             Some(DisplayOutput {
                 id: name.clone(),
                 internal: is_internal_output(&name) || has_internal_marker(trimmed),
                 connected,
                 name,
-                current_mode,
+                current_mode: geometry.map(|(mode, _)| mode),
+                position: geometry.map(|(_, position)| position),
+                scale: None,
             })
         })
         .collect()
+}
+
+fn parse_kscreen_scale(line: &str) -> Option<f32> {
+    let (prefix, suffix) = line.split_once("Scale:")?;
+    let _ = prefix;
+    suffix
+        .split_whitespace()
+        .next()
+        .and_then(|value| value.parse::<f32>().ok())
+}
+
+fn normalize_geometry_mode(
+    mode: Option<(u32, u32)>,
+    scale: Option<f32>,
+) -> Option<(u32, u32)> {
+    let (width, height) = mode?;
+    let scale = scale?;
+
+    if (scale - 1.0).abs() < f32::EPSILON {
+        return Some((width, height));
+    }
+
+    Some((
+        ((width as f32) / scale).round() as u32,
+        ((height as f32) / scale).round() as u32,
+    ))
+}
+
+fn normalize_geometry_position(
+    position: Option<(i32, i32)>,
+    scale: Option<f32>,
+) -> Option<(i32, i32)> {
+    let (x, y) = position?;
+    let scale = scale?;
+
+    if (scale - 1.0).abs() < f32::EPSILON {
+        return Some((x, y));
+    }
+
+    Some((
+        ((x as f32) / scale).round() as i32,
+        ((y as f32) / scale).round() as i32,
+    ))
 }
 
 fn list_outputs(backend: DisplayBackend) -> Result<Vec<DisplayOutput>, String> {
@@ -337,491 +627,88 @@ fn list_outputs(backend: DisplayBackend) -> Result<Vec<DisplayOutput>, String> {
             let outputs = parse_kscreen_outputs(&raw_output);
 
             if outputs.is_empty() && !raw_output.trim().is_empty() {
-                let preview = strip_ansi_escape_sequences(&raw_output)
-                    .lines()
-                    .take(5)
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                log_event(format!(
-                    "list_outputs: backend=KscreenDoctor parse failed preview={preview}"
-                ));
                 return Err("Unable to parse kscreen-doctor output.".into());
             }
 
-            Ok::<Vec<DisplayOutput>, String>(outputs)
+            outputs
         }
         DisplayBackend::Xrandr => {
             let args = vec!["--query".into()];
-            Ok::<Vec<DisplayOutput>, String>(parse_xrandr_outputs(&run_command("xrandr", &args)?))
+            parse_xrandr_outputs(&run_command("xrandr", &args)?)
         }
-    }?;
-
-    log_event(format!(
-        "list_outputs: backend={backend:?} outputs=[{}]",
-        describe_outputs(&outputs)
-    ));
-    Ok(outputs)
-}
-
-fn detect_display_pair(backend: DisplayBackend) -> Result<DisplayPair, String> {
-    let outputs = list_outputs(backend)?;
-
-    let anchor = find_anchor_output(&outputs)
-        .ok_or_else(|| "Could not find any active display output.".to_string())?;
-
-    let external = match backend {
-        DisplayBackend::KscreenDoctor => find_external_output(&outputs)
-            .or_else(|| find_known_external_output(&outputs))
-            .ok_or_else(|| "Could not find a connected secondary display.".to_string())?,
-        DisplayBackend::Xrandr => find_external_output(&outputs)
-            .ok_or_else(|| "Could not find a connected secondary display.".to_string())?,
     };
 
-    log_event(format!(
-        "detect_display_pair: backend={backend:?} anchor={} external={}",
-        anchor.name, external.name
-    ));
-    Ok(DisplayPair { anchor, external })
-}
-
-fn detect_internal_anchor(
-    backend: DisplayBackend,
-) -> Result<(DisplayOutput, Vec<DisplayOutput>), String> {
-    let outputs = list_outputs(backend)?;
-    let internal = find_internal_output(&outputs)
-        .ok_or_else(|| "Could not find the laptop's internal display.".to_string())?;
-
-    log_event(format!(
-        "detect_internal_anchor: backend={backend:?} internal={}",
-        internal.name
-    ));
-    Ok((internal, outputs))
-}
-
-fn ensure_anchor_only(
-    backend: DisplayBackend,
-    anchor: &DisplayOutput,
-    outputs: &[DisplayOutput],
-) -> Result<(), String> {
-    log_event(format!(
-        "ensure_anchor_only: backend={backend:?} anchor={} outputs=[{}]",
-        anchor.name,
-        describe_outputs(outputs)
-    ));
-    match backend {
-        DisplayBackend::KscreenDoctor => {
-            let mut args = vec![
-                format!("output.{}.enable", anchor.id),
-                format!("output.{}.primary", anchor.id),
-                format!("output.{}.position.0,0", anchor.id),
-            ];
-
-            for output in outputs.iter().filter(|output| output.id != anchor.id) {
-                args.push(format!("output.{}.disable", output.id));
-            }
-
-            run_command("kscreen-doctor", &args).map(|_| ())
-        }
-        DisplayBackend::Xrandr => {
-            let mut disable_args = Vec::new();
-
-            for output in outputs.iter().filter(|output| output.name != anchor.name) {
-                disable_args.push("--output".into());
-                disable_args.push(output.name.clone());
-                disable_args.push("--off".into());
-            }
-
-            if let Some((width, height)) = anchor.current_mode {
-                disable_args.push("--fb".into());
-                disable_args.push(format!("{width}x{height}"));
-            }
-
-            if !disable_args.is_empty() {
-                log_event(format!(
-                    "ensure_anchor_only: xrandr disable pass for anchor={} fb={:?}",
-                    anchor.name, anchor.current_mode
-                ));
-                run_command("xrandr", &disable_args)?;
-            }
-
-            let enable_args = vec![
-                "--output".into(),
-                anchor.name.clone(),
-                "--auto".into(),
-                "--primary".into(),
-            ];
-            log_event(format!(
-                "ensure_anchor_only: xrandr enable pass for anchor={}",
-                anchor.name
-            ));
-            run_command("xrandr", &enable_args).map(|_| ())
-        }
-    }
-}
-
-fn set_extended(backend: DisplayBackend, pair: &DisplayPair) -> Result<(), String> {
-    log_event(format!(
-        "set_extended: backend={backend:?} anchor={} external={}",
-        pair.anchor.name, pair.external.name
-    ));
-    match backend {
-        DisplayBackend::KscreenDoctor => {
-            if let Some(((external_x, external_y), (anchor_x, anchor_y))) =
-                saved_hdmi1_layout_positions(pair)
-            {
-                let saved_layout_args = vec![
-                    format!("output.{}.enable", pair.external.id),
-                    format!(
-                        "output.{}.position.{external_x},{external_y}",
-                        pair.external.id
-                    ),
-                    format!("output.{}.enable", pair.anchor.id),
-                    format!("output.{}.primary", pair.anchor.id),
-                    format!("output.{}.position.{anchor_x},{anchor_y}", pair.anchor.id),
-                ];
-                return run_command("kscreen-doctor", &saved_layout_args).map(|_| ());
-            }
-
-            let anchor_height =
-                resolve_output_mode_with_retries(&pair.anchor).map(|(_, height)| height);
-            let Some(anchor_height) = anchor_height else {
-                return Err("Could not determine laptop display mode.".into());
-            };
-
-            // Activate the second output below the laptop first so the desktop
-            // expands cleanly before we place it in its final position.
-            let provisional_args = vec![
-                format!("output.{}.enable", pair.anchor.id),
-                format!("output.{}.primary", pair.anchor.id),
-                format!("output.{}.position.0,0", pair.anchor.id),
-                format!("output.{}.enable", pair.external.id),
-                format!("output.{}.position.0,{anchor_height}", pair.external.id),
-            ];
-            run_command("kscreen-doctor", &provisional_args)?;
-
-            let external_height =
-                resolve_output_mode_with_retries(&pair.external).map(|(_, height)| height);
-            let Some(external_height) = external_height else {
-                return Err("Could not determine secondary display mode.".into());
-            };
-
-            let positioned_args = vec![
-                format!("output.{}.enable", pair.external.id),
-                format!("output.{}.position.0,0", pair.external.id),
-                format!("output.{}.enable", pair.anchor.id),
-                format!("output.{}.primary", pair.anchor.id),
-                format!("output.{}.position.0,{external_height}", pair.anchor.id),
-            ];
-            run_command("kscreen-doctor", &positioned_args).map(|_| ())
-        }
-        DisplayBackend::Xrandr => {
-            let anchor_args = vec![
-                "--output".into(),
-                pair.anchor.name.clone(),
-                "--auto".into(),
-                "--primary".into(),
-            ];
-            run_command("xrandr", &anchor_args)?;
-
-            let external_args = vec![
-                "--output".into(),
-                pair.external.name.clone(),
-                "--auto".into(),
-                "--above".into(),
-                pair.anchor.name.clone(),
-            ];
-            run_command("xrandr", &external_args).map(|_| ())
-        }
-    }
-}
-
-fn apply_laptop_only_layout(backend: DisplayBackend) -> Result<(), String> {
-    log_event(format!("apply_laptop_only_layout: backend={backend:?}"));
-    let (anchor, outputs) = detect_internal_anchor(backend)?;
-    ensure_anchor_only(backend, &anchor, &outputs)
-}
-
-fn is_transient_hdmi1_layout_error(err: &str) -> bool {
-    err.contains("Could not find any active display output.")
-        || err.contains("Could not find a connected secondary display.")
-        || err.contains("Unable to parse kscreen-doctor output.")
-        || err.contains("BadMatch")
-        || err.contains("Configure crtc")
-        || err.contains("cannot find mode")
-}
-
-fn is_transient_hdmi2_layout_error(err: &str) -> bool {
-    err.contains("Could not find the laptop's internal display.")
-        || err.contains("Unable to parse kscreen-doctor output.")
-        || err.contains("BadMatch")
-        || err.contains("Configure crtc")
-        || err.contains("cannot find mode")
-}
-
-fn prepare_hdmi1_layout(backend: DisplayBackend) -> Result<(), String> {
-    let mut last_error = "Could not find a connected secondary display.".to_string();
-
-    for attempt in 0..HDMI1_LAYOUT_ATTEMPTS {
-        log_event(format!(
-            "prepare_hdmi1_layout: attempt={} backend={backend:?}",
-            attempt + 1
-        ));
-        let result = detect_display_pair(backend).and_then(|pair| set_extended(backend, &pair));
-
-        match result {
-            Ok(()) => return Ok(()),
-            Err(err) => {
-                last_error = err;
-                log_event(format!(
-                    "prepare_hdmi1_layout: attempt={} err={}",
-                    attempt + 1,
-                    last_error
-                ));
-
-                if attempt + 1 < HDMI1_LAYOUT_ATTEMPTS
-                    && is_transient_hdmi1_layout_error(&last_error)
-                {
-                    std::thread::sleep(HDMI1_LAYOUT_RETRY_DELAY);
-                    continue;
-                }
-
-                return Err(last_error);
-            }
-        }
-    }
-
-    Err(last_error)
-}
-
-fn prepare_hdmi2_layout(backend: DisplayBackend) -> Result<(), String> {
-    let mut last_error = "Could not find the laptop's internal display.".to_string();
-    let mut stable_checks = 0;
-    let mut finalized_topology_disable = backend != DisplayBackend::KscreenDoctor;
-
-    for attempt in 0..HDMI2_LAYOUT_ATTEMPTS {
-        log_event(format!(
-            "prepare_hdmi2_layout: attempt={} backend={backend:?} stable_checks={stable_checks}",
-            attempt + 1
-        ));
-        let result = if attempt == 0 {
-            apply_laptop_only_layout(backend)
-        } else {
-            list_outputs(backend).and_then(|outputs| {
-                if has_connected_external_output(&outputs) {
-                    stable_checks = 0;
-                    log_event(format!(
-                        "prepare_hdmi2_layout: external still connected, reapplying layout; outputs=[{}]",
-                        describe_outputs(&outputs)
-                    ));
-                    apply_laptop_only_layout(backend)
-                } else if backend == DisplayBackend::KscreenDoctor
-                    && !finalized_topology_disable
-                    && outputs.len() > 1
-                {
-                    stable_checks = 0;
-                    log_event(format!(
-                        "prepare_hdmi2_layout: finalizing KScreenDoctor disable pass; outputs=[{}]",
-                        describe_outputs(&outputs)
-                    ));
-                    match apply_laptop_only_layout(backend) {
-                        Ok(()) => {
-                            finalized_topology_disable = true;
-                            Ok(())
-                        }
-                        Err(err) => Err(err),
-                    }
-                } else {
-                    // A few consecutive stable reads help avoid reporting success
-                    // while the desktop stack is still removing the external output.
-                    stable_checks += 1;
-                    Ok(())
-                }
-            })
-        };
-
-        match result {
-            Ok(()) if stable_checks >= HDMI2_LAYOUT_STABILITY_CHECKS => {
-                log_event("prepare_hdmi2_layout: stabilized successfully");
-                return Ok(());
-            }
-            Ok(()) => {
-                if attempt + 1 < HDMI2_LAYOUT_ATTEMPTS {
-                    std::thread::sleep(HDMI2_LAYOUT_RETRY_DELAY);
-                    continue;
-                }
-            }
-            Err(err) => {
-                last_error = err;
-                log_event(format!(
-                    "prepare_hdmi2_layout: attempt={} err={}",
-                    attempt + 1,
-                    last_error
-                ));
-
-                if attempt + 1 < HDMI2_LAYOUT_ATTEMPTS
-                    && is_transient_hdmi2_layout_error(&last_error)
-                {
-                    std::thread::sleep(HDMI2_LAYOUT_RETRY_DELAY);
-                    continue;
-                }
-
-                return Err(last_error);
-            }
-        }
-    }
-
-    if stable_checks > 0 {
-        Ok(())
-    } else {
-        Err(last_error)
-    }
+    Ok(outputs)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn output(name: &str, connected: bool, internal: bool) -> DisplayOutput {
-        DisplayOutput {
-            id: name.into(),
-            name: name.into(),
-            connected,
-            internal,
-            current_mode: None,
-        }
-    }
-
-    fn active_output(
-        name: &str,
-        connected: bool,
-        internal: bool,
-        width: u32,
-        height: u32,
-    ) -> DisplayOutput {
-        DisplayOutput {
-            id: name.into(),
-            name: name.into(),
-            connected,
-            internal,
-            current_mode: Some((width, height)),
-        }
-    }
-
     #[test]
-    fn detects_internal_output_from_standard_connector_names() {
-        assert!(is_internal_output("eDP-1"));
-        assert!(is_internal_output("LVDS-1"));
-        assert!(is_internal_output("DSI-1"));
-        assert!(!is_internal_output("HDMI-A-1"));
-    }
+    fn parses_xrandr_geometry_and_position() {
+        let outputs = parse_xrandr_outputs("eDP-1 connected primary 1920x1080+0+1080\nHDMI-A-1 connected 2560x1440+0+0\n");
 
-    #[test]
-    fn falls_back_to_non_external_connected_output() {
-        let outputs = vec![
-            output("Unknown-1", true, false),
-            output("HDMI-A-1", true, false),
-        ];
-
-        let internal = find_internal_output(&outputs).expect("expected laptop display");
-
-        assert_eq!(internal.name, "Unknown-1");
-    }
-
-    #[test]
-    fn prefers_explicit_internal_output_when_available() {
-        let outputs = vec![output("eDP-1", true, true), output("HDMI-A-1", true, false)];
-
-        let internal = find_internal_output(&outputs).expect("expected laptop display");
-
-        assert_eq!(internal.name, "eDP-1");
-    }
-
-    #[test]
-    fn falls_back_to_any_connected_output_as_anchor() {
-        let outputs = vec![
-            output("Unknown-1", true, false),
-            output("HDMI-A-1", false, false),
-        ];
-
-        let anchor = find_anchor_output(&outputs).expect("expected anchor output");
-
-        assert_eq!(anchor.name, "Unknown-1");
-    }
-
-    #[test]
-    fn laptop_only_layout_requires_internal_display() {
-        let outputs = vec![output("HDMI-A-1", true, false)];
-
-        assert!(find_internal_output(&outputs).is_none());
-    }
-
-    #[test]
-    fn detects_connected_secondary_display() {
-        let outputs = vec![output("eDP-1", true, true), output("HDMI-A-1", true, false)];
-
-        let external = find_external_output(&outputs).expect("expected external output");
-
-        assert_eq!(external.name, "HDMI-A-1");
-    }
-
-    #[test]
-    fn falls_back_to_known_external_output_for_wayland_style_topology() {
-        let outputs = vec![
-            output("eDP-1", false, true),
-            output("HDMI-A-1", false, false),
-        ];
-
-        let external =
-            find_known_external_output(&outputs).expect("expected known external output");
-
-        assert_eq!(external.name, "HDMI-A-1");
-    }
-
-    #[test]
-    fn detects_when_connected_external_output_is_present() {
-        let outputs = vec![
-            active_output("eDP-1", true, true, 1920, 1200),
-            active_output("HDMI-A-1", true, false, 2944, 1656),
-        ];
-
-        assert!(has_connected_external_output(&outputs));
-    }
-
-    #[test]
-    fn ignores_disconnected_external_output_in_stability_check() {
-        let outputs = vec![
-            active_output("eDP-1", true, true, 1920, 1200),
-            output("HDMI-A-1", false, false),
-        ];
-
-        assert!(!has_connected_external_output(&outputs));
-    }
-
-    #[test]
-    fn parses_xrandr_output_lines() {
-        let outputs = parse_xrandr_outputs(
-            "eDP-1 connected primary 1920x1080+0+0\nHDMI-A-1 connected 2560x1440+1920+0\nDP-1 disconnected\n",
-        );
-
-        assert_eq!(outputs.len(), 3);
-        assert!(outputs[0].internal);
-        assert!(outputs[1].connected);
-        assert!(!outputs[2].connected);
+        assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].current_mode, Some((1920, 1080)));
-        assert_eq!(outputs[1].current_mode, Some((2560, 1440)));
+        assert_eq!(outputs[0].position, Some((0, 1080)));
+        assert_eq!(outputs[1].position, Some((0, 0)));
     }
 
     #[test]
-    fn parses_output_mode_from_xrandr_geometry() {
-        assert_eq!(parse_output_mode("1920x1080+0+0"), Some((1920, 1080)));
-        assert_eq!(parse_output_mode("2560x1440"), Some((2560, 1440)));
-        assert_eq!(parse_output_mode("primary"), None);
-    }
+    fn merges_fallback_connection_state_and_modes() {
+        let preferred = vec![
+            DisplayOutput {
+                id: "1".into(),
+                name: "eDP-1".into(),
+                connected: false,
+                internal: true,
+                current_mode: None,
+                position: None,
+                scale: None,
+            },
+            DisplayOutput {
+                id: "2".into(),
+                name: "HDMI-A-1".into(),
+                connected: false,
+                internal: false,
+                current_mode: None,
+                position: None,
+                scale: None,
+            },
+        ];
+        let fallback = vec![
+            DisplayOutput {
+                id: "eDP-1".into(),
+                name: "eDP-1".into(),
+                connected: true,
+                internal: true,
+                current_mode: Some((1920, 1200)),
+                position: Some((0, 0)),
+                scale: None,
+            },
+            DisplayOutput {
+                id: "HDMI-A-1".into(),
+                name: "HDMI-A-1".into(),
+                connected: true,
+                internal: false,
+                current_mode: Some((2944, 1656)),
+                position: Some((0, 0)),
+                scale: None,
+            },
+        ];
 
-    #[test]
-    fn prefers_existing_output_mode_when_available() {
-        let output = active_output("eDP-1", true, true, 1920, 1200);
+        let merged = merge_output_data(preferred, &fallback);
 
-        assert_eq!(resolve_output_mode(&output), Some((1920, 1200)));
+        assert!(merged.iter().any(|output| {
+            output.name == "eDP-1"
+                && output.connected
+                && output.current_mode == Some((1920, 1200))
+        }));
+        assert!(merged.iter().any(|output| {
+            output.name == "HDMI-A-1"
+                && output.connected
+                && output.current_mode == Some((2944, 1656))
+        }));
     }
 }
