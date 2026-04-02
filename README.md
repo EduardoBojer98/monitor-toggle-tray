@@ -82,6 +82,12 @@ Display backend selection is automatic:
 
 KDE Plasma is supported, including layout capture from `kwinoutputconfig.json` when available.
 
+## TODO
+
+- investigate support for GNOME and other non-KDE desktop environments, especially tray host compatibility and Wayland display management outside Plasma
+- document which desktop environments are confirmed to work on X11 vs Wayland
+- evaluate whether a non-tray fallback UI is needed for desktops without StatusNotifier support
+
 ## Building From Source
 
 From the project root:
