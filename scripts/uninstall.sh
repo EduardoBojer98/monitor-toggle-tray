@@ -3,15 +3,19 @@
 set -euo pipefail
 
 APP_ID="monitor-toggle-tray"
-APP_NAME="Monitor Toggle"
-BIN_PATH="${HOME}/.local/bin/${APP_ID}"
-DESKTOP_PATH="${HOME}/.local/share/applications/${APP_ID}.desktop"
-AUTOSTART_PATH="${HOME}/.config/autostart/${APP_ID}.desktop"
-ICON_PATH="${HOME}/.local/share/icons/hicolor/scalable/apps/${APP_ID}.svg"
-ICON_HDMI1_PATH="${HOME}/.local/share/icons/hicolor/scalable/apps/${APP_ID}-hdmi1.svg"
-ICON_HDMI2_PATH="${HOME}/.local/share/icons/hicolor/scalable/apps/${APP_ID}-hdmi2.svg"
-CONFIG_DIR="${HOME}/.config/${APP_ID}"
-STATE_DIR="${HOME}/.local/state/${APP_ID}"
+APP_NAME="Monitor Input & Layout Switcher"
+XDG_BIN_HOME="${XDG_BIN_HOME:-${HOME}/.local/bin}"
+XDG_DATA_HOME="${XDG_DATA_HOME:-${HOME}/.local/share}"
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}"
+XDG_STATE_HOME="${XDG_STATE_HOME:-${HOME}/.local/state}"
+BIN_PATH="${XDG_BIN_HOME}/${APP_ID}"
+DESKTOP_PATH="${XDG_DATA_HOME}/applications/${APP_ID}.desktop"
+AUTOSTART_PATH="${XDG_CONFIG_HOME}/autostart/${APP_ID}.desktop"
+ICON_PATH="${XDG_DATA_HOME}/icons/hicolor/scalable/apps/${APP_ID}.svg"
+ICON_HDMI1_PATH="${XDG_DATA_HOME}/icons/hicolor/scalable/apps/${APP_ID}-hdmi1.svg"
+ICON_HDMI2_PATH="${XDG_DATA_HOME}/icons/hicolor/scalable/apps/${APP_ID}-hdmi2.svg"
+CONFIG_DIR="${XDG_CONFIG_HOME}/${APP_ID}"
+STATE_DIR="${XDG_STATE_HOME}/${APP_ID}"
 
 if pgrep -x "${APP_ID}" >/dev/null 2>&1; then
     echo "Stopping running ${APP_NAME} instance..."
@@ -29,11 +33,19 @@ rm -rf "${CONFIG_DIR}"
 rm -rf "${STATE_DIR}"
 
 if command -v update-desktop-database >/dev/null 2>&1; then
-    update-desktop-database "${HOME}/.local/share/applications" >/dev/null 2>&1 || true
+    update-desktop-database "${XDG_DATA_HOME}/applications" >/dev/null 2>&1 || true
 fi
 
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
-    gtk-update-icon-cache "${HOME}/.local/share/icons/hicolor" >/dev/null 2>&1 || true
+    gtk-update-icon-cache "${XDG_DATA_HOME}/icons/hicolor" >/dev/null 2>&1 || true
 fi
 
-echo "Uninstalled ${APP_ID} from your user profile."
+if command -v xdg-desktop-menu >/dev/null 2>&1; then
+    xdg-desktop-menu forceupdate >/dev/null 2>&1 || true
+fi
+
+if command -v xdg-icon-resource >/dev/null 2>&1; then
+    xdg-icon-resource forceupdate >/dev/null 2>&1 || true
+fi
+
+echo "Uninstalled ${APP_NAME} (${APP_ID}) from your user profile."

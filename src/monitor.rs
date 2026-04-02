@@ -104,8 +104,7 @@ pub fn discover_monitors() -> Result<MonitorSnapshot, String> {
         let matched_ddc = if output.internal {
             None
         } else {
-            match_ddc_monitor(&output, sysfs, &ddc_index)
-                .or_else(|| single_external_match.clone())
+            match_ddc_monitor(&output, sysfs, &ddc_index).or_else(|| single_external_match.clone())
         };
 
         let display_name = output_label(&output, sysfs, matched_ddc.as_ref());
@@ -549,11 +548,7 @@ fn parse_edid_text_descriptor(edid: &[u8], descriptor_type: u8) -> Option<String
     }
 
     for chunk in edid[54..126].chunks_exact(18) {
-        if chunk[0] == 0x00
-            && chunk[1] == 0x00
-            && chunk[2] == 0x00
-            && chunk[3] == descriptor_type
-        {
+        if chunk[0] == 0x00 && chunk[1] == 0x00 && chunk[2] == 0x00 && chunk[3] == descriptor_type {
             let text = String::from_utf8_lossy(&chunk[5..18])
                 .trim_matches(char::from(0))
                 .trim()
@@ -624,7 +619,10 @@ fn normalize_hex_value(value: &str) -> Option<String> {
         return None;
     }
 
-    Some(format!("0x{:02x}", u8::from_str_radix(normalized, 16).ok()?))
+    Some(format!(
+        "0x{:02x}",
+        u8::from_str_radix(normalized, 16).ok()?
+    ))
 }
 
 fn normalize_key_part(value: &str) -> String {

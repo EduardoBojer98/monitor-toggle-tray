@@ -42,7 +42,9 @@ pub fn discover_outputs() -> Result<(DisplayBackend, Vec<DisplayOutput>), String
             Ok(outputs) if !outputs.is_empty() => discovered.push((backend, outputs)),
             Ok(_) => last_error = "No display outputs were detected.".into(),
             Err(err) => {
-                log_event(format!("discover_outputs: backend={backend:?} failed: {err}"));
+                log_event(format!(
+                    "discover_outputs: backend={backend:?} failed: {err}"
+                ));
                 last_error = err;
             }
         }
@@ -69,6 +71,7 @@ pub fn disable_outputs(primary_output: &str, outputs_to_disable: &[String]) -> R
     let (backend, outputs) = discover_outputs()?;
     let primary = find_output(&outputs, primary_output)
         .ok_or_else(|| format!("Primary display {primary_output} is no longer available."))?;
+    let solo_primary_position = primary_only_position(&primary);
 
     let targets = outputs
         .iter()
@@ -91,6 +94,10 @@ pub fn disable_outputs(primary_output: &str, outputs_to_disable: &[String]) -> R
             let mut args = vec![
                 format!("output.{}.enable", primary.id),
                 format!("output.{}.primary", primary.id),
+                format!(
+                    "output.{}.position.{},{}",
+                    primary.id, solo_primary_position.0, solo_primary_position.1
+                ),
             ];
 
             for output in targets.iter().filter(|output| output.name != primary.name) {
@@ -105,6 +112,8 @@ pub fn disable_outputs(primary_output: &str, outputs_to_disable: &[String]) -> R
                 primary.name.clone(),
                 "--auto".into(),
                 "--primary".into(),
+                "--pos".into(),
+                format!("{}x{}", solo_primary_position.0, solo_primary_position.1),
             ];
 
             for output in targets.iter().filter(|output| output.name != primary.name) {
@@ -116,6 +125,11 @@ pub fn disable_outputs(primary_output: &str, outputs_to_disable: &[String]) -> R
             run_command("xrandr", &args).map(|_| ())
         }
     }
+}
+
+fn primary_only_position(primary: &DisplayOutput) -> (i32, i32) {
+    let _ = primary;
+    (0, 0)
 }
 
 pub fn enable_outputs(
@@ -353,7 +367,10 @@ fn current_desktop_right_edge() -> Result<i32, String> {
         .filter(|output| output.connected && output.current_mode.is_some())
         .map(|output| {
             let x = output.position.map(|(x, _)| x).unwrap_or(0);
-            let width = output.current_mode.map(|(width, _)| width as i32).unwrap_or(0);
+            let width = output
+                .current_mode
+                .map(|(width, _)| width as i32)
+                .unwrap_or(0);
             x + width
         })
         .max()
@@ -585,10 +602,7 @@ fn parse_kscreen_scale(line: &str) -> Option<f32> {
         .and_then(|value| value.parse::<f32>().ok())
 }
 
-fn normalize_geometry_mode(
-    mode: Option<(u32, u32)>,
-    scale: Option<f32>,
-) -> Option<(u32, u32)> {
+fn normalize_geometry_mode(mode: Option<(u32, u32)>, scale: Option<f32>) -> Option<(u32, u32)> {
     let (width, height) = mode?;
     let scale = scale?;
 
@@ -647,7 +661,9 @@ mod tests {
 
     #[test]
     fn parses_xrandr_geometry_and_position() {
-        let outputs = parse_xrandr_outputs("eDP-1 connected primary 1920x1080+0+1080\nHDMI-A-1 connected 2560x1440+0+0\n");
+        let outputs = parse_xrandr_outputs(
+            "eDP-1 connected primary 1920x1080+0+1080\nHDMI-A-1 connected 2560x1440+0+0\n",
+        );
 
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].current_mode, Some((1920, 1080)));
@@ -701,14 +717,38 @@ mod tests {
         let merged = merge_output_data(preferred, &fallback);
 
         assert!(merged.iter().any(|output| {
-            output.name == "eDP-1"
-                && output.connected
-                && output.current_mode == Some((1920, 1200))
+            output.name == "eDP-1" && output.connected && output.current_mode == Some((1920, 1200))
         }));
         assert!(merged.iter().any(|output| {
             output.name == "HDMI-A-1"
                 && output.connected
                 && output.current_mode == Some((2944, 1656))
         }));
+    }
+
+    #[test]
+    fn parses_kscreen_output_with_scale() {
+        let outputs =
+            parse_kscreen_outputs("Output: 1 eDP-1 connected enabled 3840x2400+0+0 Scale: 2\n");
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].current_mode, Some((1920, 1200)));
+        assert_eq!(outputs[0].position, Some((0, 0)));
+        assert_eq!(outputs[0].scale, Some(2.0));
+    }
+
+    #[test]
+    fn resets_primary_to_origin_for_primary_only_layout() {
+        let primary = DisplayOutput {
+            id: "1".into(),
+            name: "eDP-1".into(),
+            connected: true,
+            internal: true,
+            current_mode: Some((1920, 1080)),
+            position: Some((0, 1080)),
+            scale: None,
+        };
+
+        assert_eq!(primary_only_position(&primary), (0, 0));
     }
 }

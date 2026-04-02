@@ -1,10 +1,12 @@
-use crate::config::ConfigStore;
+use crate::config::{ConfigStore, QuickSwitchState};
 use crate::display;
 use crate::monitor::{self, MonitorCache, MonitorInfo, MonitorSnapshot};
+use crate::settings_window;
 use crate::tray::MonitorTray;
 use fs2::FileExt;
 use ksni::TrayService;
 use notify_rust::Notification;
+use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -12,20 +14,21 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::Thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use serde::Deserialize;
 
 pub const APP_ID: &str = "monitor-toggle-tray";
-pub const APP_NAME: &str = "Monitor Toggle";
+pub const APP_NAME: &str = "Monitor Input & Layout Switcher";
 
 #[derive(Clone)]
 pub struct SharedState {
     pub config_store: ConfigStore,
     pub monitor_cache: MonitorCache,
+    pub switch_in_progress: Arc<AtomicBool>,
+    pub last_status: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Clone)]
@@ -56,6 +59,84 @@ pub fn notify(summary: &str, body: &str) {
     Notification::new().summary(summary).body(body).show().ok();
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiagnosticsReport {
+    pub lines: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SettingsView {
+    pub primary_monitor_id: Option<String>,
+    pub autostart_enabled: bool,
+    pub status_text: String,
+    pub diagnostics: Vec<String>,
+    pub monitors: Vec<SettingsMonitorView>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SettingsMonitorView {
+    pub id: String,
+    pub display_name: String,
+    pub output_name: String,
+    pub connected: bool,
+    pub active: bool,
+    pub internal: bool,
+    pub is_primary: bool,
+    pub include_in_quick_switch: bool,
+    pub laptop_input: Option<String>,
+    pub toggle_input: Option<String>,
+    pub current_input: Option<String>,
+    pub available_inputs: Vec<monitor::InputSource>,
+    pub ddc_status: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SettingsUpdate {
+    pub primary_monitor_id: Option<String>,
+    pub autostart_enabled: bool,
+    pub monitors: Vec<SettingsMonitorUpdate>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SettingsMonitorUpdate {
+    pub id: String,
+    pub display_name: String,
+    pub internal: bool,
+    pub include_in_quick_switch: bool,
+    pub laptop_input: Option<String>,
+    pub toggle_input: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuickSwitchReport {
+    pub state: QuickSwitchState,
+    pub layout_changed: bool,
+    pub switched_inputs: usize,
+    pub notes: Vec<String>,
+}
+
+impl QuickSwitchReport {
+    pub fn message(&self) -> String {
+        let state_label = match self.state {
+            QuickSwitchState::ControlledMonitorsOff => "controlled monitors off",
+            QuickSwitchState::ControlledMonitorsOn => "controlled monitors on",
+        };
+        let mut parts = vec![format!(
+            "Quick switch complete: {state_label}. Layout {}. Inputs switched: {}.",
+            if self.layout_changed {
+                "updated"
+            } else {
+                "unchanged"
+            },
+            self.switched_inputs
+        )];
+        if !self.notes.is_empty() {
+            parts.push(format!("Notes: {}", self.notes.join(" | ")));
+        }
+        parts.join(" ")
+    }
+}
+
 pub fn tray_icon_theme_path() -> String {
     tray_icon_search_dir()
         .map(|path| path.to_string_lossy().into_owned())
@@ -70,6 +151,20 @@ pub fn tray_icon_available() -> bool {
     tray_icon_search_dir()
         .map(|dir| dir.join(format!("{APP_ID}.svg")).exists())
         .unwrap_or(false)
+}
+
+pub fn app_icon_path() -> Option<PathBuf> {
+    let installed = app_icon_install_path();
+    if installed.exists() {
+        return Some(installed);
+    }
+
+    let bundled = bundled_icon_dir().join(format!("{APP_ID}.svg"));
+    if bundled.exists() {
+        return Some(bundled);
+    }
+
+    None
 }
 
 pub fn autostart_enabled() -> bool {
@@ -205,7 +300,11 @@ pub fn resolve_primary(snapshot: &MonitorSnapshot, shared: &SharedState) -> Opti
         }
     }
 
-    snapshot.monitors.iter().find(|monitor| monitor.connected).cloned()
+    snapshot
+        .monitors
+        .iter()
+        .find(|monitor| monitor.connected)
+        .cloned()
 }
 
 pub fn controlled_monitors(snapshot: &MonitorSnapshot, shared: &SharedState) -> Vec<MonitorInfo> {
@@ -224,100 +323,194 @@ pub fn controlled_monitors(snapshot: &MonitorSnapshot, shared: &SharedState) -> 
         .collect()
 }
 
-pub fn set_primary_monitor(shared: &SharedState, monitor_id: &str) -> Result<(), String> {
-    let snapshot = refresh_snapshot(shared)?;
-    let monitor = snapshot
-        .monitors
-        .iter()
-        .find(|monitor| monitor.id == monitor_id)
-        .ok_or_else(|| "Selected monitor is no longer available.".to_string())?;
-
-    shared.config_store.update(|config| {
-        config.primary_monitor_id = Some(monitor.id.clone());
-        config
-            .settings_mut_or_insert(&monitor.id, &monitor.display_name)
-            .display_name = monitor.display_name.clone();
-    })?;
-
-    Ok(())
+pub fn current_switch_state(
+    shared: &SharedState,
+    snapshot: &MonitorSnapshot,
+) -> Option<QuickSwitchState> {
+    shared
+        .config_store
+        .current()
+        .last_quick_switch_state
+        .or_else(|| inferred_switch_state(snapshot))
 }
 
-pub fn toggle_controlled_monitor(shared: &SharedState, monitor_id: &str) -> Result<bool, String> {
-    let snapshot = refresh_snapshot(shared)?;
-    let monitor = snapshot
-        .monitors
-        .iter()
-        .find(|monitor| monitor.id == monitor_id)
-        .ok_or_else(|| "Selected monitor is no longer available.".to_string())?;
+pub fn diagnostics_report(shared: &SharedState) -> DiagnosticsReport {
+    let snapshot = current_snapshot(shared).ok();
+    let mut lines = Vec::new();
 
-    if monitor.internal {
-        return Err("The primary built-in display cannot be toggled.".into());
+    lines.push(format!(
+        "Quick switch busy: {}",
+        if shared.switch_in_progress.load(Ordering::SeqCst) {
+            "yes"
+        } else {
+            "no"
+        }
+    ));
+
+    if let Some(snapshot) = snapshot.as_ref() {
+        let controlled = controlled_monitors(snapshot, shared);
+        lines.push(format!("Detected monitors: {}", snapshot.monitors.len()));
+        lines.push(format!("Controlled monitors: {}", controlled.len()));
+        lines.push(format!(
+            "Last known switch state: {}",
+            current_switch_state(shared, snapshot)
+                .map(quick_switch_state_label)
+                .unwrap_or("unknown")
+        ));
+    } else {
+        lines.push("Detected monitors: unavailable".into());
+        lines.push("Controlled monitors: unavailable".into());
+        lines.push("Last known switch state: unavailable".into());
     }
 
-    shared.config_store.update(|config| {
-        let settings = config.settings_mut_or_insert(&monitor.id, &monitor.display_name);
-        settings.include_in_quick_switch = !settings.include_in_quick_switch;
-        settings.include_in_quick_switch
+    for program in ["ddcutil", "xrandr", "kscreen-doctor"] {
+        lines.push(format!(
+            "{program}: {}",
+            if command_exists(program) {
+                "available"
+            } else {
+                "missing"
+            }
+        ));
+    }
+
+    lines.push(format!(
+        "Tray icon asset: {}",
+        if tray_icon_available() {
+            "available"
+        } else {
+            "missing"
+        }
+    ));
+    lines.push(format!(
+        "Autostart: {}",
+        if autostart_enabled() {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    ));
+    lines.push(format!("Log file: {}", log_file_path().to_string_lossy()));
+
+    DiagnosticsReport { lines }
+}
+
+pub fn load_settings_view(shared: &SharedState) -> Result<SettingsView, String> {
+    let snapshot = refresh_snapshot(shared)?;
+    let config = shared.config_store.current();
+    let resolved_primary_id = resolve_primary(&snapshot, shared).map(|monitor| monitor.id);
+    let diagnostics = diagnostics_report(shared).lines;
+    let status_text = current_status_text(shared);
+
+    let monitors = snapshot
+        .monitors
+        .iter()
+        .map(|monitor| {
+            let settings = config.settings(&monitor.id);
+            let available_inputs = monitor
+                .ddc
+                .as_ref()
+                .map(|ddc| {
+                    if ddc.supported_inputs.is_empty() {
+                        monitor::fallback_input_choices(ddc.current_input.as_deref())
+                    } else {
+                        ddc.supported_inputs.clone()
+                    }
+                })
+                .unwrap_or_default();
+            let ddc_status = match monitor.ddc.as_ref() {
+                Some(ddc) => format!(
+                    "DDC/CI: {}{}",
+                    if ddc.input_switching_supported {
+                        "available"
+                    } else {
+                        "limited"
+                    },
+                    if ddc.capabilities_known {
+                        ", inputs detected"
+                    } else {
+                        ", using fallback choices"
+                    }
+                ),
+                None => "DDC/CI: unavailable".into(),
+            };
+
+            SettingsMonitorView {
+                id: monitor.id.clone(),
+                display_name: monitor.display_name.clone(),
+                output_name: monitor.output_name.clone(),
+                connected: monitor.connected,
+                active: monitor.active,
+                internal: monitor.internal,
+                is_primary: resolved_primary_id.as_deref() == Some(monitor.id.as_str()),
+                include_in_quick_switch: settings
+                    .is_some_and(|settings| settings.include_in_quick_switch),
+                laptop_input: settings.and_then(|settings| settings.laptop_input.clone()),
+                toggle_input: settings.and_then(|settings| settings.toggle_input.clone()),
+                current_input: monitor
+                    .ddc
+                    .as_ref()
+                    .and_then(|ddc| ddc.current_input.clone()),
+                available_inputs,
+                ddc_status,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Ok(SettingsView {
+        primary_monitor_id: resolved_primary_id,
+        autostart_enabled: autostart_enabled(),
+        status_text,
+        diagnostics,
+        monitors,
     })
 }
 
-pub fn set_laptop_input(
-    shared: &SharedState,
-    monitor_id: &str,
-    input: Option<&str>,
-) -> Result<(), String> {
-    let snapshot = refresh_snapshot(shared)?;
-    let monitor = snapshot
-        .monitors
-        .iter()
-        .find(|monitor| monitor.id == monitor_id)
-        .ok_or_else(|| "Selected monitor is no longer available.".to_string())?;
-
+pub fn apply_settings(shared: &SharedState, update: SettingsUpdate) -> Result<String, String> {
     shared.config_store.update(|config| {
-        let settings = config.settings_mut_or_insert(&monitor.id, &monitor.display_name);
-        settings.laptop_input = input.map(|value| value.to_string());
+        config.primary_monitor_id = update.primary_monitor_id.clone();
+
+        for monitor in &update.monitors {
+            let settings = config.settings_mut_or_insert(&monitor.id, &monitor.display_name);
+            settings.include_in_quick_switch = if monitor.internal {
+                false
+            } else {
+                monitor.include_in_quick_switch
+            };
+            settings.laptop_input = monitor.laptop_input.clone();
+            settings.toggle_input = if monitor.internal {
+                None
+            } else {
+                monitor.toggle_input.clone()
+            };
+        }
     })?;
 
-    Ok(())
-}
+    let autostart_was_enabled = autostart_enabled();
+    if autostart_was_enabled != update.autostart_enabled {
+        set_autostart(update.autostart_enabled)?;
+    }
 
-pub fn set_toggle_input(
-    shared: &SharedState,
-    monitor_id: &str,
-    input: Option<&str>,
-) -> Result<(), String> {
-    let snapshot = refresh_snapshot(shared)?;
-    let monitor = snapshot
-        .monitors
-        .iter()
-        .find(|monitor| monitor.id == monitor_id)
-        .ok_or_else(|| "Selected monitor is no longer available.".to_string())?;
-
-    shared.config_store.update(|config| {
-        let settings = config.settings_mut_or_insert(&monitor.id, &monitor.display_name);
-        settings.toggle_input = input.map(|value| value.to_string());
-    })?;
-
-    Ok(())
-}
-
-pub fn capture_current_input_as_laptop(shared: &SharedState, monitor_id: &str) -> Result<(), String> {
-    let snapshot = refresh_snapshot(shared)?;
-    let monitor = snapshot
-        .monitors
-        .iter()
-        .find(|monitor| monitor.id == monitor_id)
-        .ok_or_else(|| "Selected monitor is no longer available.".to_string())?;
-    let current_input = monitor
-        .ddc
-        .as_ref()
-        .and_then(|ddc| ddc.current_input.clone())
-        .ok_or_else(|| "Current monitor input is not available for this display.".to_string())?;
-
-    set_laptop_input(shared, monitor_id, Some(&current_input))
+    shared.monitor_cache.invalidate();
+    *shared.last_status.lock().unwrap() = Some("Settings saved.".into());
+    Ok("Settings saved.".into())
 }
 
 pub fn quick_switch(shared: &SharedState) -> Result<String, String> {
+    if shared
+        .switch_in_progress
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("A quick switch is already running.".into());
+    }
+
+    let result = quick_switch_inner(shared).map(|report| report.message());
+    shared.switch_in_progress.store(false, Ordering::SeqCst);
+    result
+}
+
+fn quick_switch_inner(shared: &SharedState) -> Result<QuickSwitchReport, String> {
     let snapshot = refresh_snapshot(shared)?;
     let primary = resolve_primary(&snapshot, shared)
         .ok_or_else(|| "No primary display is currently available.".to_string())?;
@@ -327,20 +520,21 @@ pub fn quick_switch(shared: &SharedState) -> Result<String, String> {
         return Err("No external monitors are selected for quick switch.".into());
     }
 
-    let turn_off = controlled.iter().any(|monitor| monitor.active);
+    let direction = infer_desired_switch_direction(shared, &snapshot, &controlled);
     let config = shared.config_store.current();
     let mut notes = Vec::new();
+    let mut switched_inputs = 0;
 
     let outputs = controlled
         .iter()
         .map(|monitor| display::OutputLayout {
             name: monitor.output_name.clone(),
-            position: config
-                .settings(&monitor.id)
-                .and_then(|settings| match (settings.saved_position_x, settings.saved_position_y) {
+            position: config.settings(&monitor.id).and_then(|settings| {
+                match (settings.saved_position_x, settings.saved_position_y) {
                     (Some(x), Some(y)) => Some((x, y)),
                     _ => None,
-                }),
+                }
+            }),
             size: config.settings(&monitor.id).and_then(|settings| {
                 match (settings.saved_width, settings.saved_height) {
                     (Some(width), Some(height)) => Some((width, height)),
@@ -349,7 +543,9 @@ pub fn quick_switch(shared: &SharedState) -> Result<String, String> {
             }),
         })
         .collect::<Vec<_>>();
-    if turn_off {
+    let mut layout_changed = false;
+
+    if direction == QuickSwitchState::ControlledMonitorsOff {
         let output_names = outputs
             .iter()
             .map(|layout| layout.name.clone())
@@ -360,20 +556,28 @@ pub fn quick_switch(shared: &SharedState) -> Result<String, String> {
             output_names.join(", ")
         ));
         display::disable_outputs(&primary.output_name, &output_names)?;
-        std::thread::sleep(Duration::from_millis(250));
+        layout_changed = true;
+        wait_for_output_activity_state(&output_names, false, Duration::from_secs(3)).ok();
+        refresh_plasma_shell_after_primary_only_switch();
     }
 
     for monitor in &controlled {
         let settings = config.settings(&monitor.id);
-        let desired_input = if turn_off {
-            settings.and_then(|settings| settings.toggle_input.as_deref())
-        } else {
-            settings.and_then(|settings| settings.laptop_input.as_deref())
+        let desired_input = match direction {
+            QuickSwitchState::ControlledMonitorsOff => {
+                settings.and_then(|settings| settings.toggle_input.as_deref())
+            }
+            QuickSwitchState::ControlledMonitorsOn => {
+                settings.and_then(|settings| settings.laptop_input.as_deref())
+            }
         };
 
         if let (Some(ddc), Some(input)) = (monitor.ddc.as_ref(), desired_input) {
             if let Err(err) = monitor::set_input_for_monitor(ddc.display_number, input) {
                 notes.push(format!("{}: {err}", monitor.display_name));
+            } else {
+                switched_inputs += 1;
+                wait_for_monitor_input(ddc.display_number, input, Duration::from_secs(2)).ok();
             }
         } else if monitor.ddc.is_none() {
             notes.push(format!(
@@ -384,20 +588,22 @@ pub fn quick_switch(shared: &SharedState) -> Result<String, String> {
             notes.push(format!(
                 "{}: no {} input is configured",
                 monitor.display_name,
-                if turn_off { "toggle-to" } else { "laptop" }
+                if direction == QuickSwitchState::ControlledMonitorsOff {
+                    "toggle-to"
+                } else {
+                    "laptop"
+                }
             ));
         }
     }
 
-    std::thread::sleep(Duration::from_millis(700));
-
-    if !turn_off {
-        let primary_position = config
-            .settings(&primary.id)
-            .and_then(|settings| match (settings.saved_position_x, settings.saved_position_y) {
+    if direction == QuickSwitchState::ControlledMonitorsOn {
+        let primary_position = config.settings(&primary.id).and_then(|settings| {
+            match (settings.saved_position_x, settings.saved_position_y) {
                 (Some(x), Some(y)) => Some((x, y)),
                 _ => primary.position,
-            });
+            }
+        });
         log_event(format!(
             "quick_switch: turning controlled monitors on primary={} primary_position={:?} outputs={}",
             primary.output_name,
@@ -409,25 +615,28 @@ pub fn quick_switch(shared: &SharedState) -> Result<String, String> {
                 .join(", ")
         ));
         display::enable_outputs(&primary.output_name, primary_position, &outputs)?;
+        layout_changed = true;
+        let output_names = outputs
+            .iter()
+            .map(|layout| layout.name.clone())
+            .collect::<Vec<_>>();
+        wait_for_output_activity_state(&output_names, true, Duration::from_secs(5)).ok();
     } else {
         log_event("quick_switch: controlled monitors switched away from laptop inputs");
     }
 
+    shared.config_store.update(|config| {
+        config.last_quick_switch_state = Some(direction);
+    })?;
     shared.monitor_cache.invalidate();
-    let state_label = if turn_off {
-        "controlled monitors off"
-    } else {
-        "controlled monitors on"
+    let report = QuickSwitchReport {
+        state: direction,
+        layout_changed,
+        switched_inputs,
+        notes,
     };
-
-    if notes.is_empty() {
-        Ok(format!("Quick switch complete: {state_label}."))
-    } else {
-        Ok(format!(
-            "Quick switch complete: {state_label}. {}",
-            notes.join(" | ")
-        ))
-    }
+    *shared.last_status.lock().unwrap() = Some(report.message());
+    Ok(report)
 }
 
 pub fn run() {
@@ -447,25 +656,33 @@ pub fn run() {
     let shared = SharedState {
         config_store: ConfigStore::load(),
         monitor_cache: MonitorCache::default(),
+        switch_in_progress: Arc::new(AtomicBool::new(false)),
+        last_status: Arc::new(Mutex::new(None)),
     };
     refresh_snapshot(&shared).ok();
 
     let quit_signal = QuitSignal::new();
     let (refresh_tx, refresh_rx) = std::sync::mpsc::channel();
+    let settings_window = settings_window::spawn(shared.clone(), refresh_tx.clone());
     let service = TrayService::new(MonitorTray {
         quit_signal: quit_signal.clone(),
         shared: shared.clone(),
         refresh_tx: refresh_tx.clone(),
+        settings_window,
     });
     let handle = service.handle();
     service.spawn();
 
     let refresh_state = shared.clone();
     let periodic_refresh_tx = refresh_tx.clone();
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(5));
-        refresh_snapshot(&refresh_state).ok();
-        periodic_refresh_tx.send(()).ok();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_secs(15));
+            if !refresh_state.switch_in_progress.load(Ordering::SeqCst) {
+                refresh_state.monitor_cache.invalidate();
+            }
+            periodic_refresh_tx.send(()).ok();
+        }
     });
 
     drop(refresh_tx);
@@ -481,7 +698,10 @@ pub fn run() {
     }
 }
 
-fn sync_config_with_snapshot(shared: &SharedState, snapshot: &MonitorSnapshot) -> Result<(), String> {
+fn sync_config_with_snapshot(
+    shared: &SharedState,
+    snapshot: &MonitorSnapshot,
+) -> Result<(), String> {
     shared.config_store.update(|config| {
         if let Some(internal_monitor) = snapshot
             .monitors
@@ -492,7 +712,7 @@ fn sync_config_with_snapshot(shared: &SharedState, snapshot: &MonitorSnapshot) -
         } else if config.primary_monitor_id.is_none() {
             config.primary_monitor_id = snapshot
                 .monitors
-                .iter()                
+                .iter()
                 .find(|monitor| monitor.connected)
                 .map(|monitor| monitor.id.clone());
         }
@@ -514,16 +734,39 @@ fn sync_config_with_snapshot(shared: &SharedState, snapshot: &MonitorSnapshot) -
     Ok(())
 }
 
+pub fn current_status_text(shared: &SharedState) -> String {
+    if shared.switch_in_progress.load(Ordering::SeqCst) {
+        return "Quick switch in progress".into();
+    }
+
+    if let Some(status) = shared.last_status.lock().unwrap().clone() {
+        return status;
+    }
+
+    let snapshot = match current_snapshot(shared) {
+        Ok(snapshot) => snapshot,
+        Err(_) => return "Monitor state unavailable".into(),
+    };
+
+    current_switch_state(shared, &snapshot)
+        .map(|state| format!("Last known state: {}", quick_switch_state_label(state)))
+        .unwrap_or_else(|| "Quick switch not run yet".into())
+}
+
 pub fn save_current_layout(shared: &SharedState) -> Result<String, String> {
     let snapshot = refresh_snapshot(shared)?;
     save_current_layout_snapshot(shared, &snapshot)
 }
 
-fn save_current_layout_snapshot(shared: &SharedState, snapshot: &MonitorSnapshot) -> Result<String, String> {
+fn save_current_layout_snapshot(
+    shared: &SharedState,
+    snapshot: &MonitorSnapshot,
+) -> Result<String, String> {
     if let Some(saved_layout) = load_kwin_output_layout(snapshot)? {
         shared.config_store.update(|config| {
             for entry in &saved_layout {
-                let settings = config.settings_mut_or_insert(&entry.monitor_id, &entry.display_name);
+                let settings =
+                    config.settings_mut_or_insert(&entry.monitor_id, &entry.display_name);
                 settings.saved_position_x = Some(entry.position.0);
                 settings.saved_position_y = Some(entry.position.1);
                 settings.saved_width = Some(entry.size.0);
@@ -536,12 +779,18 @@ fn save_current_layout_snapshot(shared: &SharedState, snapshot: &MonitorSnapshot
             .map(|entry| {
                 format!(
                     "{}@{},{} {}x{}",
-                    entry.output_name, entry.position.0, entry.position.1, entry.size.0, entry.size.1
+                    entry.output_name,
+                    entry.position.0,
+                    entry.position.1,
+                    entry.size.0,
+                    entry.size.1
                 )
             })
             .collect::<Vec<_>>()
             .join(", ");
-        log_event(format!("save_current_layout: saved positions from kwinoutputconfig={summary}"));
+        log_event(format!(
+            "save_current_layout: saved positions from kwinoutputconfig={summary}"
+        ));
         return Ok(format!("Saved current layout: {summary}"));
     }
 
@@ -630,7 +879,9 @@ struct SavedLayoutEntry {
     size: (u32, u32),
 }
 
-fn load_kwin_output_layout(snapshot: &MonitorSnapshot) -> Result<Option<Vec<SavedLayoutEntry>>, String> {
+fn load_kwin_output_layout(
+    snapshot: &MonitorSnapshot,
+) -> Result<Option<Vec<SavedLayoutEntry>>, String> {
     let path = kwin_output_config_path();
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
@@ -744,6 +995,194 @@ fn should_log_command_start_and_success(program: &str, args: &[String]) -> bool 
     }
 }
 
+fn command_exists(program: &str) -> bool {
+    env::var_os("PATH")
+        .map(|paths| env::split_paths(&paths).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .any(|dir| dir.join(program).exists())
+}
+
+fn inferred_switch_state(snapshot: &MonitorSnapshot) -> Option<QuickSwitchState> {
+    let any_external_active = snapshot
+        .monitors
+        .iter()
+        .any(|monitor| !monitor.internal && monitor.active);
+
+    Some(if any_external_active {
+        QuickSwitchState::ControlledMonitorsOn
+    } else {
+        QuickSwitchState::ControlledMonitorsOff
+    })
+}
+
+fn infer_desired_switch_direction(
+    shared: &SharedState,
+    snapshot: &MonitorSnapshot,
+    controlled: &[MonitorInfo],
+) -> QuickSwitchState {
+    let any_controlled_active = controlled.iter().any(|monitor| monitor.active);
+    let last_state = shared.config_store.current().last_quick_switch_state;
+
+    match (any_controlled_active, last_state) {
+        (true, _) => QuickSwitchState::ControlledMonitorsOff,
+        (false, Some(QuickSwitchState::ControlledMonitorsOff)) => {
+            QuickSwitchState::ControlledMonitorsOn
+        }
+        (false, Some(QuickSwitchState::ControlledMonitorsOn)) => {
+            QuickSwitchState::ControlledMonitorsOn
+        }
+        (false, None) => inferred_switch_state(snapshot)
+            .map(|state| match state {
+                QuickSwitchState::ControlledMonitorsOn => QuickSwitchState::ControlledMonitorsOff,
+                QuickSwitchState::ControlledMonitorsOff => QuickSwitchState::ControlledMonitorsOn,
+            })
+            .unwrap_or(QuickSwitchState::ControlledMonitorsOn),
+    }
+}
+
+fn quick_switch_state_label(state: QuickSwitchState) -> &'static str {
+    match state {
+        QuickSwitchState::ControlledMonitorsOn => "controlled monitors on",
+        QuickSwitchState::ControlledMonitorsOff => "controlled monitors off",
+    }
+}
+
+fn wait_for_monitor_input(
+    display_number: u32,
+    expected_input: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    while started.elapsed() < timeout {
+        let args = vec![
+            "--display".into(),
+            display_number.to_string(),
+            "getvcp".into(),
+            monitor::INPUT_VCP_CODE.into(),
+            "--brief".into(),
+        ];
+        if let Ok(output) = run_command("ddcutil", &args) {
+            if let Some(current) = parse_current_input(&output) {
+                if current == expected_input {
+                    return Ok(());
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    Err("Timed out waiting for monitor input change.".into())
+}
+
+fn wait_for_output_activity_state(
+    output_names: &[String],
+    expected_active: bool,
+    timeout: Duration,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    while started.elapsed() < timeout {
+        let (_, outputs) = display::discover_outputs()?;
+        let all_match = output_names.iter().all(|name| {
+            outputs
+                .iter()
+                .find(|output| &output.name == name)
+                .is_some_and(|output| {
+                    output.connected && output.current_mode.is_some() == expected_active
+                })
+        });
+
+        if all_match {
+            return Ok(());
+        }
+
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    Err("Timed out waiting for display state change.".into())
+}
+
+fn parse_current_input(output: &str) -> Option<String> {
+    for marker in ["current value = ", "sl=", "SNC x", "SNC X"] {
+        if let Some(start) = output.find(marker) {
+            let value = output[start + marker.len()..]
+                .chars()
+                .skip_while(|ch| ch.is_whitespace())
+                .take_while(|ch| ch.is_ascii_hexdigit() || *ch == 'x' || *ch == 'X')
+                .collect::<String>();
+            let normalized = value
+                .trim()
+                .trim_start_matches("0x")
+                .trim_start_matches("0X");
+            if let Ok(number) = u8::from_str_radix(normalized, 16) {
+                return Some(format!("0x{number:02x}"));
+            }
+        }
+    }
+    None
+}
+
+fn refresh_plasma_shell_after_primary_only_switch() {
+    if !is_kde_wayland_session() {
+        return;
+    }
+
+    log_event("refresh_plasma_shell_after_primary_only_switch: scheduling plasmashell restart");
+
+    if let Err(err) = schedule_detached_plasmashell_replace(Duration::from_millis(900)) {
+        log_event(format!(
+            "refresh_plasma_shell_after_primary_only_switch: could not schedule replacement: {err}"
+        ));
+        return;
+    }
+
+    if command_exists("kquitapp6") {
+        let args = vec!["plasmashell".into()];
+        if let Err(err) = run_command("kquitapp6", &args) {
+            log_event(format!(
+                "refresh_plasma_shell_after_primary_only_switch: kquitapp6 failed: {err}"
+            ));
+        }
+        return;
+    }
+
+    if command_exists("qdbus6") {
+        let args = vec![
+            "org.kde.plasmashell".into(),
+            "/MainApplication".into(),
+            "quit".into(),
+        ];
+        if let Err(err) = run_command("qdbus6", &args) {
+            log_event(format!(
+                "refresh_plasma_shell_after_primary_only_switch: qdbus6 quit failed: {err}"
+            ));
+        }
+    }
+}
+
+fn schedule_detached_plasmashell_replace(delay: Duration) -> Result<(), String> {
+    let seconds = format!("{:.3}", delay.as_secs_f32());
+    let script = format!("sleep {seconds}; nohup plasmashell --replace >/dev/null 2>&1 &");
+
+    Command::new("sh")
+        .arg("-lc")
+        .arg(script)
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("could not launch detached shell restart: {err}"))
+}
+
+fn is_kde_wayland_session() -> bool {
+    let session_type = env::var("XDG_SESSION_TYPE")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let current_desktop = env::var("XDG_CURRENT_DESKTOP")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    session_type == "wayland" && current_desktop.contains("kde")
+}
+
 fn app_icon_install_dir() -> PathBuf {
     let data_home = env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
         let home = env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -825,7 +1264,7 @@ fn autostart_desktop_entry() -> Result<String, String> {
         .replace('"', "\\\"");
 
     Ok(format!(
-        "[Desktop Entry]\nType=Application\nVersion=1.0\nName={APP_NAME}\nComment=Tray app for switching monitor input\nExec=\"{exec}\"\nIcon={icon}\nTerminal=false\nCategories=Utility;\nX-GNOME-Autostart-enabled=true\n"
+        "[Desktop Entry]\nType=Application\nVersion=1.0\nName={APP_NAME}\nComment=Tray app for switching monitor inputs and restoring desktop layouts\nExec=\"{exec}\"\nIcon={icon}\nTerminal=false\nCategories=Utility;\nX-GNOME-Autostart-enabled=true\n"
     ))
 }
 
@@ -840,7 +1279,7 @@ fn acquire_single_instance_lock() -> Result<File, String> {
         .map_err(|err| format!("Could not open lock file {path}: {err}"))?;
 
     file.try_lock_exclusive()
-        .map_err(|_| "Another instance of Monitor Toggle is already running.".to_string())?;
+        .map_err(|_| format!("Another instance of {APP_NAME} is already running."))?;
 
     file.set_len(0)
         .map_err(|err| format!("Could not initialize lock file {path}: {err}"))?;
@@ -848,4 +1287,108 @@ fn acquire_single_instance_lock() -> Result<File, String> {
         .map_err(|err| format!("Could not write lock file {path}: {err}"))?;
 
     Ok(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::monitor::MonitorInfo;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_shared_state(last_quick_switch_state: Option<QuickSwitchState>) -> SharedState {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let shared = SharedState {
+            config_store: ConfigStore::new_for_tests(PathBuf::from(format!(
+                "/tmp/monitor-toggle-tray-test-{}-{unique}.toml",
+                std::process::id(),
+            ))),
+            monitor_cache: MonitorCache::default(),
+            switch_in_progress: Arc::new(AtomicBool::new(false)),
+            last_status: Arc::new(Mutex::new(None)),
+        };
+        shared
+            .config_store
+            .update(|config| {
+                config
+                    .monitor_settings
+                    .retain(|settings| settings.monitor_id != "external:HDMI-A-1");
+                config
+                    .monitor_settings
+                    .push(crate::config::MonitorSettings {
+                        monitor_id: "external:HDMI-A-1".into(),
+                        display_name: "Dell".into(),
+                        include_in_quick_switch: true,
+                        ..Default::default()
+                    });
+                config.last_quick_switch_state = last_quick_switch_state;
+            })
+            .unwrap();
+        shared
+    }
+
+    fn snapshot_with_controlled_active(active: bool) -> MonitorSnapshot {
+        MonitorSnapshot {
+            monitors: vec![
+                MonitorInfo {
+                    id: "internal:eDP-1".into(),
+                    display_name: "Built-in display".into(),
+                    output_name: "eDP-1".into(),
+                    connected: true,
+                    active: true,
+                    internal: true,
+                    position: Some((0, 0)),
+                    current_mode: Some((1920, 1080)),
+                    ddc: None,
+                },
+                MonitorInfo {
+                    id: "external:HDMI-A-1".into(),
+                    display_name: "Dell".into(),
+                    output_name: "HDMI-A-1".into(),
+                    connected: true,
+                    active,
+                    internal: false,
+                    position: Some((0, 0)),
+                    current_mode: active.then_some((2560, 1440)),
+                    ddc: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn parses_current_input_from_multiple_formats() {
+        assert_eq!(parse_current_input("VCP 60 SNC x11"), Some("0x11".into()));
+        assert_eq!(
+            parse_current_input("VCP code 0x60 (Input Source): HDMI-1 (sl=0x11)"),
+            Some("0x11".into())
+        );
+    }
+
+    #[test]
+    fn infers_switch_direction_from_active_controlled_monitors() {
+        let shared = test_shared_state(None);
+        let snapshot = snapshot_with_controlled_active(true);
+        let controlled = controlled_monitors(&snapshot, &shared);
+
+        assert_eq!(
+            infer_desired_switch_direction(&shared, &snapshot, &controlled),
+            QuickSwitchState::ControlledMonitorsOff
+        );
+    }
+
+    #[test]
+    fn defaults_to_turning_monitors_on_when_all_controlled_outputs_are_off() {
+        let shared = test_shared_state(Some(QuickSwitchState::ControlledMonitorsOff));
+        let snapshot = snapshot_with_controlled_active(false);
+        let controlled = controlled_monitors(&snapshot, &shared);
+
+        assert_eq!(
+            infer_desired_switch_direction(&shared, &snapshot, &controlled),
+            QuickSwitchState::ControlledMonitorsOn
+        );
+    }
 }

@@ -3,34 +3,46 @@
 set -euo pipefail
 
 APP_ID="monitor-toggle-tray"
-APP_NAME="Monitor Toggle"
+APP_NAME="Monitor Input & Layout Switcher"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN_DIR="${HOME}/.local/bin"
-APP_DIR="${HOME}/.local/share/applications"
-ICON_DIR="${HOME}/.local/share/icons/hicolor/scalable/apps"
-AUTOSTART_DIR="${HOME}/.config/autostart"
-CONFIG_DIR="${HOME}/.config/${APP_ID}"
-STATE_DIR="${HOME}/.local/state/${APP_ID}"
+XDG_BIN_HOME="${XDG_BIN_HOME:-${HOME}/.local/bin}"
+XDG_DATA_HOME="${XDG_DATA_HOME:-${HOME}/.local/share}"
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}"
+XDG_STATE_HOME="${XDG_STATE_HOME:-${HOME}/.local/state}"
+BIN_DIR="${XDG_BIN_HOME}"
+APP_DIR="${XDG_DATA_HOME}/applications"
+ICON_DIR="${XDG_DATA_HOME}/icons/hicolor/scalable/apps"
+AUTOSTART_DIR="${XDG_CONFIG_HOME}/autostart"
+CONFIG_DIR="${XDG_CONFIG_HOME}/${APP_ID}"
+STATE_DIR="${XDG_STATE_HOME}/${APP_ID}"
 BIN_PATH="${BIN_DIR}/${APP_ID}"
 DESKTOP_PATH="${APP_DIR}/${APP_ID}.desktop"
 ICON_PATH="${ICON_DIR}/${APP_ID}.svg"
 AUTOSTART_PATH="${AUTOSTART_DIR}/${APP_ID}.desktop"
 
+escape_desktop_value() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
 write_desktop_entry() {
     local target_path="$1"
     local autostart_enabled="${2:-false}"
+    local escaped_exec
+    escaped_exec="$(escape_desktop_value "${BIN_PATH}")"
 
     cat > "${target_path}" <<EOF
 [Desktop Entry]
 Type=Application
 Version=1.0
 Name=${APP_NAME}
-Comment=Tray app for switching monitor input
-Exec=${BIN_PATH}
+Comment=Tray app for switching monitor inputs and restoring desktop layouts
+Exec="${escaped_exec}"
 Icon=${APP_ID}
 Terminal=false
 Categories=Utility;
 StartupNotify=false
+StartupWMClass=${APP_ID}
+X-GNOME-UsesNotifications=true
 EOF
 
     if [[ "${autostart_enabled}" == "true" ]]; then
@@ -74,7 +86,15 @@ if command -v update-desktop-database >/dev/null 2>&1; then
 fi
 
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
-    gtk-update-icon-cache "${HOME}/.local/share/icons/hicolor" >/dev/null 2>&1 || true
+    gtk-update-icon-cache "${XDG_DATA_HOME}/icons/hicolor" >/dev/null 2>&1 || true
+fi
+
+if command -v xdg-desktop-menu >/dev/null 2>&1; then
+    xdg-desktop-menu forceupdate >/dev/null 2>&1 || true
+fi
+
+if command -v xdg-icon-resource >/dev/null 2>&1; then
+    xdg-icon-resource forceupdate >/dev/null 2>&1 || true
 fi
 
 if [[ "${WAS_RUNNING}" == "true" ]]; then
@@ -95,5 +115,5 @@ If ~/.local/bin is in your PATH, you can also run:
 The launcher is available in your applications menu as:
   ${APP_NAME}
 
-Once the tray icon is running, enable autostart from the tray menu if you want it to start on login.
+Open Settings from the tray menu to configure monitors, inputs, layout restore, and autostart.
 EOF

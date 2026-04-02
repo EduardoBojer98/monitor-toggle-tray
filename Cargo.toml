@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 fs2 = "0.4"
+gtk4 = "0.10"
 ksni = "0.2"
 notify-rust = "4"
 serde = { version = "1", features = ["derive"] }

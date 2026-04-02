@@ -5,9 +5,17 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum QuickSwitchState {
+    ControlledMonitorsOn,
+    ControlledMonitorsOff,
+}
+
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub struct AppConfig {
     pub primary_monitor_id: Option<String>,
+    pub last_quick_switch_state: Option<QuickSwitchState>,
     pub monitor_settings: Vec<MonitorSettings>,
 }
 
@@ -48,6 +56,14 @@ impl ConfigStore {
         self.state.lock().unwrap().clone()
     }
 
+    #[cfg(test)]
+    pub fn new_for_tests(path: PathBuf) -> Self {
+        Self {
+            path,
+            state: Arc::new(Mutex::new(AppConfig::default())),
+        }
+    }
+
     pub fn update<T, F>(&self, update: F) -> Result<T, String>
     where
         F: FnOnce(&mut AppConfig) -> T,
@@ -67,8 +83,29 @@ impl ConfigStore {
                 .map_err(|err| format!("Could not create config directory: {err}"))?;
         }
 
-        fs::write(&self.path, serialized)
-            .map_err(|err| format!("Could not write config file {}: {err}", self.path.display()))
+        let mut temp_path = self.path.clone();
+        let extension = self
+            .path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| format!("{value}.tmp-{}", std::process::id()))
+            .unwrap_or_else(|| format!("tmp-{}", std::process::id()));
+        temp_path.set_extension(extension);
+
+        fs::write(&temp_path, serialized).map_err(|err| {
+            format!(
+                "Could not write temporary config file {}: {err}",
+                temp_path.display()
+            )
+        })?;
+
+        fs::rename(&temp_path, &self.path).map_err(|err| {
+            format!(
+                "Could not replace config file {} with {}: {err}",
+                self.path.display(),
+                temp_path.display()
+            )
+        })
     }
 }
 
