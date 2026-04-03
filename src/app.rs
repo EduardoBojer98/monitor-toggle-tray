@@ -558,7 +558,7 @@ fn quick_switch_inner(shared: &SharedState) -> Result<QuickSwitchReport, String>
         display::disable_outputs(&primary.output_name, &output_names)?;
         layout_changed = true;
         wait_for_output_activity_state(&output_names, false, Duration::from_secs(3)).ok();
-        refresh_plasma_shell_after_primary_only_switch();
+        refresh_plasma_task_manager_after_primary_only_switch();
     }
 
     for monitor in &controlled {
@@ -1122,54 +1122,88 @@ fn parse_current_input(output: &str) -> Option<String> {
     None
 }
 
-fn refresh_plasma_shell_after_primary_only_switch() {
+fn refresh_plasma_task_manager_after_primary_only_switch() {
     if !is_kde_wayland_session() {
         return;
     }
 
-    log_event("refresh_plasma_shell_after_primary_only_switch: scheduling plasmashell restart");
-
-    if let Err(err) = schedule_detached_plasmashell_replace(Duration::from_millis(900)) {
+    if !command_exists("qdbus6") {
         log_event(format!(
-            "refresh_plasma_shell_after_primary_only_switch: could not schedule replacement: {err}"
+            "refresh_plasma_task_manager_after_primary_only_switch: qdbus6 is not available"
         ));
         return;
     }
 
-    if command_exists("kquitapp6") {
-        let args = vec!["plasmashell".into()];
-        if let Err(err) = run_command("kquitapp6", &args) {
-            log_event(format!(
-                "refresh_plasma_shell_after_primary_only_switch: kquitapp6 failed: {err}"
-            ));
-        }
-        return;
+    log_event(
+        "refresh_plasma_task_manager_after_primary_only_switch: refreshing Plasma task-manager applets",
+    );
+
+    let script = r#"
+const taskManagerTypes = [
+  "org.kde.plasma.icontasks",
+  "org.kde.plasma.taskmanager"
+];
+
+function refreshTaskManagersForContainment(containment) {
+  if (!containment || typeof containment.widgets !== "function") {
+    return 0;
+  }
+
+  let refreshed = 0;
+  const widgets = containment.widgets();
+
+  for (let i = 0; i < widgets.length; ++i) {
+    const widget = widgets[i];
+    if (!widget || taskManagerTypes.indexOf(widget.type) === -1) {
+      continue;
     }
 
-    if command_exists("qdbus6") {
-        let args = vec![
-            "org.kde.plasmashell".into(),
-            "/MainApplication".into(),
-            "quit".into(),
-        ];
-        if let Err(err) = run_command("qdbus6", &args) {
-            log_event(format!(
-                "refresh_plasma_shell_after_primary_only_switch: qdbus6 quit failed: {err}"
-            ));
-        }
+    if (typeof widget.reloadConfig === "function") {
+      widget.reloadConfig();
+      ++refreshed;
+      continue;
     }
+
+    if (typeof widget.currentConfigGroup === "function" &&
+        typeof widget.writeConfig === "function" &&
+        typeof widget.readConfig === "function") {
+      const originalGroup = widget.currentConfigGroup();
+      widget.currentConfigGroup = ["General"];
+      const filterByScreen = widget.readConfig("filterByScreen", "");
+      widget.writeConfig("filterByScreen", filterByScreen);
+      widget.currentConfigGroup = originalGroup;
+      ++refreshed;
+    }
+  }
+
+  return refreshed;
 }
 
-fn schedule_detached_plasmashell_replace(delay: Duration) -> Result<(), String> {
-    let seconds = format!("{:.3}", delay.as_secs_f32());
-    let script = format!("sleep {seconds}; nohup plasmashell --replace >/dev/null 2>&1 &");
+let refreshed = 0;
+const plasmaPanels = panels();
+for (let i = 0; i < plasmaPanels.length; ++i) {
+  refreshed += refreshTaskManagersForContainment(plasmaPanels[i]);
+}
 
-    Command::new("sh")
-        .arg("-lc")
-        .arg(script)
-        .spawn()
-        .map(|_| ())
-        .map_err(|err| format!("could not launch detached shell restart: {err}"))
+const plasmaDesktops = desktops();
+for (let i = 0; i < plasmaDesktops.length; ++i) {
+  refreshed += refreshTaskManagersForContainment(plasmaDesktops[i]);
+}
+
+print("refreshed-task-managers=" + refreshed);
+"#;
+    let args = vec![
+        "org.kde.plasmashell".into(),
+        "/PlasmaShell".into(),
+        "org.kde.PlasmaShell.evaluateScript".into(),
+        script.into(),
+    ];
+
+    if let Err(err) = run_command("qdbus6", &args) {
+        log_event(format!(
+            "refresh_plasma_task_manager_after_primary_only_switch: targeted refresh failed: {err}"
+        ));
+    }
 }
 
 fn is_kde_wayland_session() -> bool {
