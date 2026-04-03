@@ -16,6 +16,28 @@ ICON_HDMI1_PATH="${XDG_DATA_HOME}/icons/hicolor/scalable/apps/${APP_ID}-hdmi1.sv
 ICON_HDMI2_PATH="${XDG_DATA_HOME}/icons/hicolor/scalable/apps/${APP_ID}-hdmi2.svg"
 CONFIG_DIR="${XDG_CONFIG_HOME}/${APP_ID}"
 STATE_DIR="${XDG_STATE_HOME}/${APP_ID}"
+PURGE="false"
+
+for arg in "$@"; do
+    case "$arg" in
+        --purge)
+            PURGE="true"
+            ;;
+        -h|--help)
+            cat <<EOF
+Usage: ./scripts/uninstall.sh [--purge]
+
+Options:
+  --purge    Also remove user config and state directories.
+EOF
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $arg" >&2
+            exit 1
+            ;;
+    esac
+done
 
 if pgrep -x "${APP_ID}" >/dev/null 2>&1; then
     echo "Stopping running ${APP_NAME} instance..."
@@ -29,8 +51,11 @@ rm -f "${AUTOSTART_PATH}"
 rm -f "${ICON_PATH}"
 rm -f "${ICON_HDMI1_PATH}"
 rm -f "${ICON_HDMI2_PATH}"
-rm -rf "${CONFIG_DIR}"
-rm -rf "${STATE_DIR}"
+
+if [[ "${PURGE}" == "true" ]]; then
+    rm -rf "${CONFIG_DIR}"
+    rm -rf "${STATE_DIR}"
+fi
 
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "${XDG_DATA_HOME}/applications" >/dev/null 2>&1 || true
@@ -48,4 +73,9 @@ if command -v xdg-icon-resource >/dev/null 2>&1; then
     xdg-icon-resource forceupdate >/dev/null 2>&1 || true
 fi
 
-echo "Uninstalled ${APP_NAME} (${APP_ID}) from your user profile."
+if [[ "${PURGE}" == "true" ]]; then
+    echo "Uninstalled ${APP_NAME} (${APP_ID}) from your user profile and removed config/state data."
+else
+    echo "Uninstalled ${APP_NAME} (${APP_ID}) from your user profile."
+    echo "User config and logs were kept. Re-run with --purge to remove ${CONFIG_DIR} and ${STATE_DIR}."
+fi

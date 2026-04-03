@@ -302,10 +302,10 @@ fn enable_outputs_kscreen_doctor(
             output.id, position.0, position.1
         ));
 
-        if output.position.is_none() {
-            if let Some(width) = resolve_output_mode_width(&output.name)? {
-                cursor_x += width as i32;
-            }
+        if output.position.is_none()
+            && let Some(width) = resolve_output_mode_width(&output.name)?
+        {
+            cursor_x += width as i32;
         }
     }
 
@@ -350,10 +350,10 @@ fn enable_outputs_xrandr(
         ];
         run_command("xrandr", &args)?;
 
-        if output.position.is_none() {
-            if let Some(width) = resolve_output_mode_width(&output.name)? {
-                cursor_x += width as i32;
-            }
+        if output.position.is_none()
+            && let Some(width) = resolve_output_mode_width(&output.name)?
+        {
+            cursor_x += width as i32;
         }
     }
 

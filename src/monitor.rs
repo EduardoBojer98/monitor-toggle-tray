@@ -3,11 +3,15 @@ use crate::display::{self, DisplayOutput};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 pub const INPUT_VCP_CODE: &str = "60";
 const MONITOR_CACHE_TTL: Duration = Duration::from_secs(3);
+const DDC_DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(180);
+const DDC_INPUT_REFRESH_TTL: Duration = Duration::from_secs(6);
+
+static DDC_DISCOVERY_CACHE: OnceLock<Mutex<CachedDdcDiscovery>> = OnceLock::new();
 
 #[derive(Clone, Debug, Default)]
 pub struct MonitorSnapshot {
@@ -36,6 +40,13 @@ pub struct DdcMonitorInfo {
     pub input_switching_supported: bool,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct DdcCacheStatus {
+    pub monitor_count: usize,
+    pub discovery_age: Option<Duration>,
+    pub input_age: Option<Duration>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InputSource {
     pub value: String,
@@ -51,6 +62,13 @@ pub struct MonitorCache {
 struct CachedSnapshot {
     snapshot: Option<MonitorSnapshot>,
     last_refresh: Option<Instant>,
+}
+
+#[derive(Default)]
+struct CachedDdcDiscovery {
+    monitors: Vec<DiscoveredDdcMonitor>,
+    last_discovery_refresh: Option<Instant>,
+    last_input_refresh: Option<Instant>,
 }
 
 impl MonitorCache {
@@ -76,6 +94,14 @@ impl MonitorCache {
         state.last_refresh = None;
     }
 
+    pub fn last_refresh_age(&self) -> Option<Duration> {
+        self.state
+            .lock()
+            .unwrap()
+            .last_refresh
+            .map(|last_refresh| last_refresh.elapsed())
+    }
+
     fn peek(&self) -> Option<MonitorSnapshot> {
         self.state.lock().unwrap().snapshot.clone()
     }
@@ -88,6 +114,25 @@ impl MonitorCache {
             None => true,
         }
     }
+}
+
+pub fn ddc_cache_status() -> DdcCacheStatus {
+    let state = ddc_discovery_cache().lock().unwrap();
+
+    DdcCacheStatus {
+        monitor_count: state.monitors.len(),
+        discovery_age: state
+            .last_discovery_refresh
+            .map(|last_refresh| last_refresh.elapsed()),
+        input_age: state
+            .last_input_refresh
+            .map(|last_refresh| last_refresh.elapsed()),
+    }
+}
+
+pub fn invalidate_ddc_input_cache() {
+    let mut state = ddc_discovery_cache().lock().unwrap();
+    state.last_input_refresh = None;
 }
 
 pub fn discover_monitors() -> Result<MonitorSnapshot, String> {
@@ -188,19 +233,61 @@ pub fn fallback_input_choices(current_input: Option<&str>) -> Vec<InputSource> {
         },
     ];
 
-    if let Some(current_input) = current_input.and_then(normalize_hex_value) {
-        if !inputs.iter().any(|input| input.value == current_input) {
-            inputs.push(InputSource {
-                label: input_label(&current_input),
-                value: current_input,
-            });
-        }
+    if let Some(current_input) = current_input.and_then(normalize_hex_value)
+        && !inputs.iter().any(|input| input.value == current_input)
+    {
+        inputs.push(InputSource {
+            label: input_label(&current_input),
+            value: current_input,
+        });
     }
 
     inputs
 }
 
 fn discover_ddc_monitors() -> Vec<DiscoveredDdcMonitor> {
+    let now = Instant::now();
+    let (cached_monitors, refresh_discovery, refresh_inputs) = {
+        let state = ddc_discovery_cache().lock().unwrap();
+        let refresh_discovery = state
+            .last_discovery_refresh
+            .is_none_or(|last_refresh| last_refresh.elapsed() >= DDC_DISCOVERY_CACHE_TTL);
+        let refresh_inputs = !state.monitors.is_empty()
+            && state
+                .last_input_refresh
+                .is_none_or(|last_refresh| last_refresh.elapsed() >= DDC_INPUT_REFRESH_TTL);
+        (state.monitors.clone(), refresh_discovery, refresh_inputs)
+    };
+
+    if refresh_discovery {
+        let monitors = discover_ddc_monitors_uncached();
+        let mut state = ddc_discovery_cache().lock().unwrap();
+        state.monitors = monitors.clone();
+        state.last_discovery_refresh = Some(now);
+        state.last_input_refresh = Some(now);
+        return monitors;
+    }
+
+    if refresh_inputs {
+        let mut monitors = cached_monitors;
+        for monitor in &mut monitors {
+            refresh_ddc_current_input(monitor);
+        }
+
+        let mut state = ddc_discovery_cache().lock().unwrap();
+        state.monitors = monitors.clone();
+        state.last_input_refresh = Some(now);
+        return monitors;
+    }
+
+    cached_monitors
+}
+
+fn ddc_discovery_cache() -> &'static Mutex<CachedDdcDiscovery> {
+    DDC_DISCOVERY_CACHE.get_or_init(|| Mutex::new(CachedDdcDiscovery::default()))
+}
+
+fn discover_ddc_monitors_uncached() -> Vec<DiscoveredDdcMonitor> {
     let args = vec!["detect".into(), "--brief".into()];
     let output = match run_command("ddcutil", &args) {
         Ok(output) => output,
@@ -217,18 +304,7 @@ fn discover_ddc_monitors() -> Vec<DiscoveredDdcMonitor> {
 }
 
 fn enrich_ddc_monitor(mut monitor: DiscoveredDdcMonitor) -> DiscoveredDdcMonitor {
-    let current_args = vec![
-        "--display".into(),
-        monitor.display_number.to_string(),
-        "getvcp".into(),
-        INPUT_VCP_CODE.into(),
-        "--brief".into(),
-    ];
-
-    monitor.current_input = run_command("ddcutil", &current_args)
-        .ok()
-        .and_then(|text| parse_getvcp_input(&text));
-    monitor.input_switching_supported = monitor.current_input.is_some();
+    refresh_ddc_current_input(&mut monitor);
 
     let capabilities_args = vec![
         "--display".into(),
@@ -249,6 +325,25 @@ fn enrich_ddc_monitor(mut monitor: DiscoveredDdcMonitor) -> DiscoveredDdcMonitor
     }
 
     monitor
+}
+
+fn refresh_ddc_current_input(monitor: &mut DiscoveredDdcMonitor) {
+    let current_args = vec![
+        "--display".into(),
+        monitor.display_number.to_string(),
+        "getvcp".into(),
+        INPUT_VCP_CODE.into(),
+        "--brief".into(),
+    ];
+
+    monitor.current_input = run_command("ddcutil", &current_args)
+        .ok()
+        .and_then(|text| parse_getvcp_input(&text));
+    monitor.input_switching_supported = monitor.current_input.is_some();
+
+    if monitor.supported_inputs.is_empty() {
+        monitor.supported_inputs = fallback_input_choices(monitor.current_input.as_deref());
+    }
 }
 
 fn parse_getvcp_input(output: &str) -> Option<String> {
@@ -431,9 +526,7 @@ fn match_ddc_monitor(
     sysfs: Option<&OutputSysfsInfo>,
     index: &BTreeMap<String, Vec<DiscoveredDdcMonitor>>,
 ) -> Option<DiscoveredDdcMonitor> {
-    let Some(sysfs) = sysfs else {
-        return None;
-    };
+    let sysfs = sysfs?;
 
     let mut keys = Vec::new();
     if let (Some(manufacturer), Some(model), Some(serial)) =
@@ -568,17 +661,16 @@ fn monitor_id_for_output(output: &DisplayOutput, sysfs: Option<&OutputSysfsInfo>
         return format!("internal:{}", output.name);
     }
 
-    if let Some(sysfs) = sysfs {
-        if let (Some(manufacturer), Some(model), Some(serial)) =
+    if let Some(sysfs) = sysfs
+        && let (Some(manufacturer), Some(model), Some(serial)) =
             (&sysfs.manufacturer, &sysfs.model, &sysfs.serial)
-        {
-            return format!(
-                "{}:{}:{}",
-                normalize_key_part(manufacturer),
-                normalize_key_part(model),
-                normalize_key_part(serial)
-            );
-        }
+    {
+        return format!(
+            "{}:{}:{}",
+            normalize_key_part(manufacturer),
+            normalize_key_part(model),
+            normalize_key_part(serial)
+        );
     }
 
     format!("output:{}", output.name)
@@ -593,16 +685,16 @@ fn output_label(
         return format!("Built-in display ({})", output.name);
     }
 
-    if let Some(sysfs) = sysfs {
-        if let Some(model) = &sysfs.model {
-            return format!("{model} ({})", output.name);
-        }
+    if let Some(sysfs) = sysfs
+        && let Some(model) = &sysfs.model
+    {
+        return format!("{model} ({})", output.name);
     }
 
-    if let Some(ddc) = ddc {
-        if !ddc.model.is_empty() {
-            return format!("{} ({})", ddc.model, output.name);
-        }
+    if let Some(ddc) = ddc
+        && !ddc.model.is_empty()
+    {
+        return format!("{} ({})", ddc.model, output.name);
     }
 
     output.name.clone()

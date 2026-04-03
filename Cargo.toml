@@ -2,6 +2,8 @@
 name = "monitor-toggle-tray"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Linux tray app for switching monitor inputs and restoring desktop layouts"
 
 [dependencies]
 fs2 = "0.4"

@@ -41,6 +41,7 @@ In practice, that means:
 
 - Tray icon with left click to run quick switch immediately
 - Tray menu with `Quick switch now`, `Settings`, and `Quit`
+- Non-blocking startup that refreshes monitor state in the background
 - Dedicated settings window with a responsive split layout
 - Pick the primary display used during quick switching
 - Choose which external monitors are included in quick switch
@@ -51,6 +52,7 @@ In practice, that means:
 - Diagnostics section for backend availability and current app state
 - Single-instance protection so only one tray instance runs at a time
 - Background refresh of monitor state
+- Clearer quick-switch summaries that report layout changes, input-switch counts, and any issues
 - Debug log written under the XDG state directory
 
 ## Requirements
@@ -106,6 +108,24 @@ cargo run
 
 The app uses a single-instance lock. If another instance is already running, a second launch exits instead of creating another tray icon.
 
+Startup is intentionally non-blocking. The tray comes up first, then the app refreshes monitor state in the background and updates the status text once detection finishes.
+
+## Quick Start
+
+If you just want to try the app from the source tree:
+
+```bash
+cargo run
+```
+
+If you want it installed into your user profile:
+
+```bash
+./scripts/install.sh
+```
+
+That installs the binary, desktop launcher, and icon under your user XDG directories.
+
 ## Running Without Installing
 
 For local testing:
@@ -118,7 +138,7 @@ This is useful while changing the code or testing monitor behavior before instal
 
 ## Installation
 
-Install the app with:
+Install the app into your user profile with:
 
 ```bash
 ./scripts/install.sh
@@ -126,17 +146,13 @@ Install the app with:
 
 The installer is user-local only. It does not write to `/usr`, `/usr/local`, or `/opt`.
 
-### What The Installer Does
+### Installed Files
 
-- builds a release binary with `cargo build --release`
-- creates user-local XDG directories when needed
-- stops a currently running instance before replacing the binary
-- installs the binary to `~/.local/bin/monitor-toggle-tray`
-- installs the icon to `~/.local/share/icons/hicolor/scalable/apps/monitor-toggle-tray.svg`
-- installs the desktop launcher to `~/.local/share/applications/monitor-toggle-tray.desktop`
-- refreshes the autostart desktop file if autostart was already enabled
-- restarts the app if it had been running before install
-- refreshes desktop and icon caches when helper tools are available
+- `~/.local/bin/monitor-toggle-tray`
+- `~/.local/share/applications/monitor-toggle-tray.desktop`
+- `~/.local/share/icons/hicolor/scalable/apps/monitor-toggle-tray.svg`
+
+If the app was already running, the installer stops it, replaces the binary, refreshes the desktop entry and icon caches when possible, and starts it again.
 
 ### Launching After Install
 
@@ -263,10 +279,18 @@ Remove the app with:
 ./scripts/uninstall.sh
 ```
 
+To also remove saved settings and logs:
+
+```bash
+./scripts/uninstall.sh --purge
+```
+
 The uninstall script:
 
 - stops a running instance if needed
-- removes the binary, launcher, icon, autostart entry, config directory, and state directory from your user profile
+- removes the binary, launcher, icon, and autostart entry from your user profile
+- keeps the config directory and state directory by default
+- removes the config directory and state directory only when you pass `--purge`
 - refreshes desktop and icon caches when helper tools are available
 
 It does not remove:
@@ -294,11 +318,24 @@ If quick switch or monitor detection is not working:
 - open `Settings` and check the diagnostics section
 - inspect the debug log at `${XDG_STATE_HOME:-~/.local/state}/monitor-toggle-tray/debug.log`
 
+If the tray icon never appears:
+
+- confirm your desktop environment supports StatusNotifier or tray icons
+- try launching from a terminal with `cargo run` or `~/.local/bin/monitor-toggle-tray`
+- check whether another instance is already running
+
 If the tray app starts but input switching does nothing:
 
 - the monitor may not support DDC/CI input switching
 - the current user may not have permission to access DDC/I2C devices
 - the monitor may expose incomplete DDC capability information
+
+If `ddcutil detect --brief` fails with a permissions error:
+
+- make sure the `i2c-dev` kernel module is available on your system
+- check whether your distro expects an `i2c` group or udev rule for DDC access
+- try `ddcutil detect --brief` manually first before configuring the app
+- if needed, follow your distro's `ddcutil` setup instructions for non-root users
 
 If the layout changes work but the monitor input does not:
 

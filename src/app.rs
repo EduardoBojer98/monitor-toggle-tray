@@ -10,18 +10,23 @@ use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::mpsc::Sender;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::Thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const APP_ID: &str = "monitor-toggle-tray";
 pub const APP_NAME: &str = "Monitor Input & Layout Switcher";
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const STARTUP_STATUS: &str = "Starting up: refreshing monitor state in the background.";
+
+static LAST_COMMAND_FAILURE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct SharedState {
@@ -110,31 +115,91 @@ pub struct SettingsMonitorUpdate {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QuickSwitchReport {
     pub state: QuickSwitchState,
+    pub controlled_monitors: usize,
+    pub output_count: usize,
     pub layout_changed: bool,
+    pub input_attempts: usize,
     pub switched_inputs: usize,
     pub notes: Vec<String>,
 }
 
 impl QuickSwitchReport {
     pub fn message(&self) -> String {
-        let state_label = match self.state {
-            QuickSwitchState::ControlledMonitorsOff => "controlled monitors off",
-            QuickSwitchState::ControlledMonitorsOn => "controlled monitors on",
+        let action_label = match self.state {
+            QuickSwitchState::ControlledMonitorsOff => "Handed",
+            QuickSwitchState::ControlledMonitorsOn => "Brought back",
+        };
+        let destination = match self.state {
+            QuickSwitchState::ControlledMonitorsOff => "to the other device",
+            QuickSwitchState::ControlledMonitorsOn => "to the laptop",
+        };
+        let layout_action = match self.state {
+            QuickSwitchState::ControlledMonitorsOff => "disabled",
+            QuickSwitchState::ControlledMonitorsOn => "restored",
         };
         let mut parts = vec![format!(
-            "Quick switch complete: {state_label}. Layout {}. Inputs switched: {}.",
-            if self.layout_changed {
-                "updated"
-            } else {
-                "unchanged"
-            },
-            self.switched_inputs
+            "Quick switch complete: {action_label} {} controlled monitor(s) {destination}.",
+            self.controlled_monitors
         )];
+        parts.push(if self.layout_changed {
+            format!(
+                "Layout {layout_action} for {} output(s).",
+                self.output_count
+            )
+        } else {
+            "Layout unchanged.".into()
+        });
+        parts.push(if self.input_attempts > 0 {
+            format!(
+                "Input switches: {}/{} command(s) succeeded.",
+                self.switched_inputs, self.input_attempts
+            )
+        } else {
+            "Input switches: none attempted.".into()
+        });
         if !self.notes.is_empty() {
-            parts.push(format!("Notes: {}", self.notes.join(" | ")));
+            parts.push(format!("Issues: {}", self.notes.join(" | ")));
         }
         parts.join(" ")
     }
+}
+
+fn set_last_status(shared: &SharedState, status: impl Into<String>) {
+    *shared.last_status.lock().unwrap() = Some(status.into());
+}
+
+fn startup_ready_message(shared: &SharedState, snapshot: &MonitorSnapshot) -> String {
+    let primary = resolve_primary(snapshot, shared)
+        .map(|monitor| monitor.display_name)
+        .unwrap_or_else(|| "Unavailable".into());
+    let controlled_count = controlled_monitors(snapshot, shared).len();
+
+    if snapshot.monitors.is_empty() {
+        "Ready. No monitors were detected yet.".into()
+    } else {
+        format!("Ready. Primary: {primary}. Controlled monitors configured: {controlled_count}.")
+    }
+}
+
+fn spawn_startup_refresh(shared: SharedState, refresh_tx: Sender<()>) {
+    std::thread::spawn(move || {
+        match refresh_snapshot(&shared) {
+            Ok(snapshot) => {
+                let message = startup_ready_message(&shared, &snapshot);
+                log_event(format!(
+                    "main: initial monitor refresh completed: {message}"
+                ));
+                set_last_status(&shared, message);
+            }
+            Err(err) => {
+                let message = format!("Startup refresh failed: {err}");
+                log_event(format!("main: initial monitor refresh failed: {err}"));
+                set_last_status(&shared, message);
+            }
+        }
+
+        refresh_tx.send(()).ok();
+    });
 }
 
 pub fn tray_icon_theme_path() -> String {
@@ -207,39 +272,131 @@ pub fn log_event(message: impl AsRef<str>) {
     }
 }
 
+fn last_command_failure_cell() -> &'static Mutex<Option<String>> {
+    LAST_COMMAND_FAILURE.get_or_init(|| Mutex::new(None))
+}
+
+fn record_last_command_failure(message: impl Into<String>) {
+    *last_command_failure_cell().lock().unwrap() = Some(message.into());
+}
+
+fn last_command_failure() -> Option<String> {
+    last_command_failure_cell().lock().unwrap().clone()
+}
+
+fn command_timeout(program: &str, args: &[String]) -> Duration {
+    match program {
+        "ddcutil" if args.iter().any(|arg| arg == "getvcp") => Duration::from_secs(3),
+        "ddcutil" if args.iter().any(|arg| arg == "setvcp") => Duration::from_secs(5),
+        "ddcutil" => Duration::from_secs(8),
+        "xrandr" | "kscreen-doctor" => Duration::from_secs(5),
+        "qdbus6" => Duration::from_secs(3),
+        _ => Duration::from_secs(10),
+    }
+}
+
+fn default_command_timeout(program: &str) -> Duration {
+    command_timeout(program, &[])
+}
+
+fn read_child_stream<R: Read>(stream: &mut Option<R>) -> Vec<u8> {
+    let mut buffer = Vec::new();
+    if let Some(mut reader) = stream.take() {
+        let _ = reader.read_to_end(&mut buffer);
+    }
+    buffer
+}
+
 pub fn run_command(program: &str, args: &[String]) -> Result<String, String> {
     if should_log_command_start_and_success(program, args) {
         log_event(format!("run_command start: {program} {}", args.join(" ")));
     }
-    let output = Command::new(program)
+    let timeout = command_timeout(program, args);
+    let started = Instant::now();
+    let mut child = Command::new(program)
         .args(args)
-        .output()
-        .map_err(|err| format!("{program}: {err}"))?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| {
+            let message = format!("{program}: {err}");
+            record_last_command_failure(message.clone());
+            message
+        })?;
 
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        if should_log_command_start_and_success(program, args) {
-            log_event(format!(
-                "run_command ok: {program} status={} stdout={} bytes stderr={} bytes",
-                output.status,
-                stdout.len(),
-                output.stderr.len()
-            ));
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = read_child_stream(&mut child.stdout);
+                let stderr = read_child_stream(&mut child.stderr);
+
+                if status.success() {
+                    let stdout_text = String::from_utf8_lossy(&stdout).into_owned();
+                    if should_log_command_start_and_success(program, args) {
+                        log_event(format!(
+                            "run_command ok: {program} status={} elapsed_ms={} stdout={} bytes stderr={} bytes",
+                            status,
+                            started.elapsed().as_millis(),
+                            stdout_text.len(),
+                            stderr.len()
+                        ));
+                    }
+                    return Ok(stdout_text);
+                }
+
+                let stderr_text = String::from_utf8_lossy(&stderr).trim().to_string();
+                let stdout_text = String::from_utf8_lossy(&stdout).trim().to_string();
+                let detail = if !stderr_text.is_empty() {
+                    stderr_text
+                } else {
+                    stdout_text
+                };
+                log_event(format!(
+                    "run_command err: {program} status={} elapsed_ms={} detail={detail}",
+                    status,
+                    started.elapsed().as_millis()
+                ));
+                let message = if detail.is_empty() {
+                    format!("{program} exited with status {status}")
+                } else {
+                    format!("{program}: {detail}")
+                };
+                record_last_command_failure(message.clone());
+                return Err(message);
+            }
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let stderr = String::from_utf8_lossy(&read_child_stream(&mut child.stderr))
+                    .trim()
+                    .to_string();
+                let stdout = String::from_utf8_lossy(&read_child_stream(&mut child.stdout))
+                    .trim()
+                    .to_string();
+                let detail = if !stderr.is_empty() { stderr } else { stdout };
+                let message = if detail.is_empty() {
+                    format!("{program}: timed out after {} ms", timeout.as_millis())
+                } else {
+                    format!(
+                        "{program}: timed out after {} ms ({detail})",
+                        timeout.as_millis()
+                    )
+                };
+                log_event(format!(
+                    "run_command timeout: {program} elapsed_ms={} args={}",
+                    started.elapsed().as_millis(),
+                    args.join(" ")
+                ));
+                record_last_command_failure(message.clone());
+                return Err(message);
+            }
+            Ok(None) => std::thread::sleep(COMMAND_POLL_INTERVAL),
+            Err(err) => {
+                let message = format!("{program}: {err}");
+                record_last_command_failure(message.clone());
+                return Err(message);
+            }
         }
-        Ok(stdout)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let detail = if !stderr.is_empty() { stderr } else { stdout };
-        log_event(format!(
-            "run_command err: {program} status={} detail={detail}",
-            output.status
-        ));
-        Err(if detail.is_empty() {
-            format!("{program} exited with status {}", output.status)
-        } else {
-            format!("{program}: {detail}")
-        })
     }
 }
 
@@ -267,6 +424,7 @@ pub fn strip_ansi_escape_sequences(text: &str) -> String {
 }
 
 pub fn refresh_snapshot(shared: &SharedState) -> Result<MonitorSnapshot, String> {
+    monitor::invalidate_ddc_input_cache();
     let snapshot = shared.monitor_cache.refresh()?;
     sync_config_with_snapshot(shared, &snapshot).ok();
     Ok(snapshot)
@@ -280,6 +438,12 @@ pub fn current_snapshot(shared: &SharedState) -> Result<MonitorSnapshot, String>
 }
 
 pub fn resolve_primary(snapshot: &MonitorSnapshot, shared: &SharedState) -> Option<MonitorInfo> {
+    let config = shared.config_store.current();
+
+    if let Some(primary) = configured_primary(snapshot, config.primary_monitor_id.as_deref()) {
+        return Some(primary);
+    }
+
     if let Some(internal_monitor) = snapshot
         .monitors
         .iter()
@@ -288,22 +452,20 @@ pub fn resolve_primary(snapshot: &MonitorSnapshot, shared: &SharedState) -> Opti
         return Some(internal_monitor.clone());
     }
 
-    let config = shared.config_store.current();
-
-    if let Some(primary_id) = config.primary_monitor_id.as_deref() {
-        if let Some(primary) = snapshot
-            .monitors
-            .iter()
-            .find(|monitor| monitor.id == primary_id && monitor.connected)
-        {
-            return Some(primary.clone());
-        }
-    }
-
     snapshot
         .monitors
         .iter()
         .find(|monitor| monitor.connected)
+        .cloned()
+}
+
+fn configured_primary(snapshot: &MonitorSnapshot, primary_id: Option<&str>) -> Option<MonitorInfo> {
+    let primary_id = primary_id?;
+
+    snapshot
+        .monitors
+        .iter()
+        .find(|monitor| monitor.id == primary_id && monitor.connected)
         .cloned()
 }
 
@@ -336,7 +498,9 @@ pub fn current_switch_state(
 
 pub fn diagnostics_report(shared: &SharedState) -> DiagnosticsReport {
     let snapshot = current_snapshot(shared).ok();
+    let config = shared.config_store.current();
     let mut lines = Vec::new();
+    let ddc_cache = monitor::ddc_cache_status();
 
     lines.push(format!(
         "Quick switch busy: {}",
@@ -346,6 +510,34 @@ pub fn diagnostics_report(shared: &SharedState) -> DiagnosticsReport {
             "no"
         }
     ));
+    lines.push(format!(
+        "Monitor snapshot cache age: {}",
+        shared
+            .monitor_cache
+            .last_refresh_age()
+            .map(format_duration)
+            .unwrap_or_else(|| "empty".into())
+    ));
+    lines.push(format!(
+        "DDC cache: {} monitors, discovery age {}, input age {}",
+        ddc_cache.monitor_count,
+        ddc_cache
+            .discovery_age
+            .map(format_duration)
+            .unwrap_or_else(|| "empty".into()),
+        ddc_cache
+            .input_age
+            .map(format_duration)
+            .unwrap_or_else(|| "empty".into())
+    ));
+
+    match display::discover_outputs() {
+        Ok((backend, outputs)) => lines.push(format!(
+            "Display backend: {backend:?} ({} outputs detected)",
+            outputs.len()
+        )),
+        Err(err) => lines.push(format!("Display backend: unavailable ({err})")),
+    }
 
     if let Some(snapshot) = snapshot.as_ref() {
         let controlled = controlled_monitors(snapshot, shared);
@@ -357,20 +549,37 @@ pub fn diagnostics_report(shared: &SharedState) -> DiagnosticsReport {
                 .map(quick_switch_state_label)
                 .unwrap_or("unknown")
         ));
+        let saved_layout_count = controlled
+            .iter()
+            .filter(|monitor| {
+                config.settings(&monitor.id).is_some_and(|settings| {
+                    settings.saved_position_x.is_some()
+                        && settings.saved_position_y.is_some()
+                        && settings.saved_width.is_some()
+                        && settings.saved_height.is_some()
+                })
+            })
+            .count();
+        lines.push(format!(
+            "Saved layout coverage: {saved_layout_count}/{} controlled monitors",
+            controlled.len()
+        ));
     } else {
         lines.push("Detected monitors: unavailable".into());
         lines.push("Controlled monitors: unavailable".into());
         lines.push("Last known switch state: unavailable".into());
+        lines.push("Saved layout coverage: unavailable".into());
     }
 
     for program in ["ddcutil", "xrandr", "kscreen-doctor"] {
         lines.push(format!(
-            "{program}: {}",
+            "{program}: {} (timeout {})",
             if command_exists(program) {
                 "available"
             } else {
                 "missing"
-            }
+            },
+            format_duration(default_command_timeout(program))
         ));
     }
 
@@ -389,6 +598,10 @@ pub fn diagnostics_report(shared: &SharedState) -> DiagnosticsReport {
         } else {
             "disabled"
         }
+    ));
+    lines.push(format!(
+        "Last command failure: {}",
+        last_command_failure().unwrap_or_else(|| "none".into())
     ));
     lines.push(format!("Log file: {}", log_file_path().to_string_lossy()));
 
@@ -523,6 +736,7 @@ fn quick_switch_inner(shared: &SharedState) -> Result<QuickSwitchReport, String>
     let direction = infer_desired_switch_direction(shared, &snapshot, &controlled);
     let config = shared.config_store.current();
     let mut notes = Vec::new();
+    let mut input_attempts = 0;
     let mut switched_inputs = 0;
 
     let outputs = controlled
@@ -557,7 +771,11 @@ fn quick_switch_inner(shared: &SharedState) -> Result<QuickSwitchReport, String>
         ));
         display::disable_outputs(&primary.output_name, &output_names)?;
         layout_changed = true;
-        wait_for_output_activity_state(&output_names, false, Duration::from_secs(3)).ok();
+        if let Err(err) =
+            wait_for_output_activity_state(&output_names, false, Duration::from_secs(3))
+        {
+            notes.push(format!("layout verification after disable: {err}"));
+        }
         refresh_plasma_task_manager_after_primary_only_switch();
     }
 
@@ -573,11 +791,19 @@ fn quick_switch_inner(shared: &SharedState) -> Result<QuickSwitchReport, String>
         };
 
         if let (Some(ddc), Some(input)) = (monitor.ddc.as_ref(), desired_input) {
+            input_attempts += 1;
             if let Err(err) = monitor::set_input_for_monitor(ddc.display_number, input) {
                 notes.push(format!("{}: {err}", monitor.display_name));
             } else {
                 switched_inputs += 1;
-                wait_for_monitor_input(ddc.display_number, input, Duration::from_secs(2)).ok();
+                if let Err(err) =
+                    wait_for_monitor_input(ddc.display_number, input, Duration::from_secs(2))
+                {
+                    notes.push(format!(
+                        "{}: switch command sent but verification failed: {err}",
+                        monitor.display_name
+                    ));
+                }
             }
         } else if monitor.ddc.is_none() {
             notes.push(format!(
@@ -620,7 +846,11 @@ fn quick_switch_inner(shared: &SharedState) -> Result<QuickSwitchReport, String>
             .iter()
             .map(|layout| layout.name.clone())
             .collect::<Vec<_>>();
-        wait_for_output_activity_state(&output_names, true, Duration::from_secs(5)).ok();
+        if let Err(err) =
+            wait_for_output_activity_state(&output_names, true, Duration::from_secs(5))
+        {
+            notes.push(format!("layout verification after restore: {err}"));
+        }
     } else {
         log_event("quick_switch: controlled monitors switched away from laptop inputs");
     }
@@ -631,11 +861,14 @@ fn quick_switch_inner(shared: &SharedState) -> Result<QuickSwitchReport, String>
     shared.monitor_cache.invalidate();
     let report = QuickSwitchReport {
         state: direction,
+        controlled_monitors: controlled.len(),
+        output_count: outputs.len(),
         layout_changed,
+        input_attempts,
         switched_inputs,
         notes,
     };
-    *shared.last_status.lock().unwrap() = Some(report.message());
+    set_last_status(shared, report.message());
     Ok(report)
 }
 
@@ -657,9 +890,8 @@ pub fn run() {
         config_store: ConfigStore::load(),
         monitor_cache: MonitorCache::default(),
         switch_in_progress: Arc::new(AtomicBool::new(false)),
-        last_status: Arc::new(Mutex::new(None)),
+        last_status: Arc::new(Mutex::new(Some(STARTUP_STATUS.into()))),
     };
-    refresh_snapshot(&shared).ok();
 
     let quit_signal = QuitSignal::new();
     let (refresh_tx, refresh_rx) = std::sync::mpsc::channel();
@@ -672,6 +904,7 @@ pub fn run() {
     });
     let handle = service.handle();
     service.spawn();
+    spawn_startup_refresh(shared.clone(), refresh_tx.clone());
 
     let refresh_state = shared.clone();
     let periodic_refresh_tx = refresh_tx.clone();
@@ -703,30 +936,34 @@ fn sync_config_with_snapshot(
     snapshot: &MonitorSnapshot,
 ) -> Result<(), String> {
     shared.config_store.update(|config| {
-        if let Some(internal_monitor) = snapshot
-            .monitors
-            .iter()
-            .find(|monitor| monitor.connected && monitor.internal)
-        {
-            config.primary_monitor_id = Some(internal_monitor.id.clone());
-        } else if config.primary_monitor_id.is_none() {
-            config.primary_monitor_id = snapshot
-                .monitors
-                .iter()
-                .find(|monitor| monitor.connected)
-                .map(|monitor| monitor.id.clone());
-        }
+        config.primary_monitor_id =
+            configured_primary(snapshot, config.primary_monitor_id.as_deref())
+                .map(|monitor| monitor.id)
+                .or_else(|| {
+                    snapshot
+                        .monitors
+                        .iter()
+                        .find(|monitor| monitor.connected && monitor.internal)
+                        .map(|monitor| monitor.id.clone())
+                })
+                .or_else(|| {
+                    snapshot
+                        .monitors
+                        .iter()
+                        .find(|monitor| monitor.connected)
+                        .map(|monitor| monitor.id.clone())
+                });
 
         for monitor in &snapshot.monitors {
             let settings = config.settings_mut_or_insert(&monitor.id, &monitor.display_name);
-            if settings.laptop_input.is_none() && monitor.active {
-                if let Some(current_input) = monitor
+            if settings.laptop_input.is_none()
+                && monitor.active
+                && let Some(current_input) = monitor
                     .ddc
                     .as_ref()
                     .and_then(|ddc| ddc.current_input.clone())
-                {
-                    settings.laptop_input = Some(current_input);
-                }
+            {
+                settings.laptop_input = Some(current_input);
             }
         }
     })?;
@@ -1003,6 +1240,14 @@ fn command_exists(program: &str) -> bool {
         .any(|dir| dir.join(program).exists())
 }
 
+fn format_duration(duration: Duration) -> String {
+    if duration.as_secs() > 0 {
+        format!("{}s", duration.as_secs())
+    } else {
+        format!("{}ms", duration.as_millis())
+    }
+}
+
 fn inferred_switch_state(snapshot: &MonitorSnapshot) -> Option<QuickSwitchState> {
     let any_external_active = snapshot
         .monitors
@@ -1062,12 +1307,11 @@ fn wait_for_monitor_input(
             monitor::INPUT_VCP_CODE.into(),
             "--brief".into(),
         ];
-        if let Ok(output) = run_command("ddcutil", &args) {
-            if let Some(current) = parse_current_input(&output) {
-                if current == expected_input {
-                    return Ok(());
-                }
-            }
+        if let Ok(output) = run_command("ddcutil", &args)
+            && let Some(current) = parse_current_input(&output)
+            && current == expected_input
+        {
+            return Ok(());
         }
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -1128,9 +1372,7 @@ fn refresh_plasma_task_manager_after_primary_only_switch() {
     }
 
     if !command_exists("qdbus6") {
-        log_event(format!(
-            "refresh_plasma_task_manager_after_primary_only_switch: qdbus6 is not available"
-        ));
+        log_event("refresh_plasma_task_manager_after_primary_only_switch: qdbus6 is not available");
         return;
     }
 
@@ -1394,6 +1636,40 @@ mod tests {
     }
 
     #[test]
+    fn resolve_primary_prefers_connected_configured_monitor() {
+        let shared = test_shared_state(None);
+        shared
+            .config_store
+            .update(|config| {
+                config.primary_monitor_id = Some("external:HDMI-A-1".into());
+            })
+            .unwrap();
+
+        let resolved = resolve_primary(&snapshot_with_controlled_active(true), &shared)
+            .map(|monitor| monitor.id);
+
+        assert_eq!(resolved, Some("external:HDMI-A-1".into()));
+    }
+
+    #[test]
+    fn sync_config_preserves_connected_primary_selection() {
+        let shared = test_shared_state(None);
+        shared
+            .config_store
+            .update(|config| {
+                config.primary_monitor_id = Some("external:HDMI-A-1".into());
+            })
+            .unwrap();
+
+        sync_config_with_snapshot(&shared, &snapshot_with_controlled_active(true)).unwrap();
+
+        assert_eq!(
+            shared.config_store.current().primary_monitor_id,
+            Some("external:HDMI-A-1".into())
+        );
+    }
+
+    #[test]
     fn parses_current_input_from_multiple_formats() {
         assert_eq!(parse_current_input("VCP 60 SNC x11"), Some("0x11".into()));
         assert_eq!(
@@ -1423,6 +1699,24 @@ mod tests {
         assert_eq!(
             infer_desired_switch_direction(&shared, &snapshot, &controlled),
             QuickSwitchState::ControlledMonitorsOn
+        );
+    }
+
+    #[test]
+    fn quick_switch_report_message_describes_action_and_counts() {
+        let report = QuickSwitchReport {
+            state: QuickSwitchState::ControlledMonitorsOff,
+            controlled_monitors: 2,
+            output_count: 2,
+            layout_changed: true,
+            input_attempts: 1,
+            switched_inputs: 1,
+            notes: vec!["Dell: no toggle-to input is configured".into()],
+        };
+
+        assert_eq!(
+            report.message(),
+            "Quick switch complete: Handed 2 controlled monitor(s) to the other device. Layout disabled for 2 output(s). Input switches: 1/1 command(s) succeeded. Issues: Dell: no toggle-to input is configured"
         );
     }
 }

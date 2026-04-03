@@ -597,17 +597,17 @@ fn target_sidebar_width(window_width: i32) -> i32 {
 }
 
 fn build_header_icon() -> gtk::Widget {
-    if let Some(icon_path) = app_icon_path() {
-        if let Some(path) = icon_path.to_str() {
-            let image = gtk::Image::from_file(path);
-            image.set_pixel_size(32);
-            let frame = gtk::Frame::new(None);
-            frame.add_css_class("header-icon-frame");
-            frame.set_size_request(44, 44);
-            frame.set_child(Some(&image));
-            frame.set_hexpand(false);
-            return frame.upcast();
-        }
+    if let Some(icon_path) = app_icon_path()
+        && let Some(path) = icon_path.to_str()
+    {
+        let image = gtk::Image::from_file(path);
+        image.set_pixel_size(32);
+        let frame = gtk::Frame::new(None);
+        frame.add_css_class("header-icon-frame");
+        frame.set_size_request(44, 44);
+        frame.set_child(Some(&image));
+        frame.set_hexpand(false);
+        return frame.upcast();
     }
 
     let image = gtk::Image::from_icon_name("video-display");
