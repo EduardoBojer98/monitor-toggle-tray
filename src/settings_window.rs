@@ -1,6 +1,6 @@
 use crate::app::{
     APP_NAME, SettingsMonitorUpdate, SettingsUpdate, SharedState, app_icon_path, apply_settings,
-    load_settings_view, notify, save_current_layout,
+    current_status_text, diagnostics_report, load_settings_view, notify, save_current_layout,
 };
 use gtk::glib::{self, ControlFlow};
 use gtk::prelude::*;
@@ -254,18 +254,6 @@ fn rebuild_window(
     quick_help_frame.set_child(Some(&quick_help_box));
     sidebar.append(&quick_help_frame);
 
-    let diagnostics_expander = gtk::Expander::builder()
-        .label("Diagnostics")
-        .expanded(false)
-        .build();
-    let diagnostics_label = gtk::Label::new(Some(&view.diagnostics.join("\n")));
-    diagnostics_label.set_xalign(0.0);
-    diagnostics_label.set_yalign(0.0);
-    diagnostics_label.set_selectable(true);
-    diagnostics_label.set_wrap(true);
-    diagnostics_expander.set_child(Some(&diagnostics_label));
-    sidebar.append(&diagnostics_expander);
-
     let sidebar_scroll = gtk::ScrolledWindow::new();
     sidebar_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
     sidebar_scroll.set_hexpand(true);
@@ -273,6 +261,11 @@ fn rebuild_window(
     sidebar_scroll.set_min_content_width(sidebar_width.clamp(280, 420));
     sidebar_scroll.set_child(Some(&sidebar));
     content.set_start_child(Some(&sidebar_scroll));
+
+    let notebook = gtk::Notebook::new();
+    notebook.set_hexpand(true);
+    notebook.set_vexpand(true);
+    notebook.add_css_class("content-tabs");
 
     let monitors_frame = gtk::Frame::new(None);
     monitors_frame.add_css_class("monitor-list");
@@ -474,7 +467,60 @@ fn rebuild_window(
 
     monitors_scroll.set_child(Some(&monitors_box));
     monitors_frame.set_child(Some(&monitors_scroll));
-    content.set_end_child(Some(&monitors_frame));
+
+    let monitors_tab_label = gtk::Label::new(Some("Monitors"));
+    notebook.append_page(&monitors_frame, Some(&monitors_tab_label));
+
+    let diagnostics_frame = gtk::Frame::new(None);
+    diagnostics_frame.add_css_class("monitor-list");
+    diagnostics_frame.add_css_class("diagnostics-card");
+    diagnostics_frame.set_hexpand(true);
+    diagnostics_frame.set_vexpand(true);
+
+    let diagnostics_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    diagnostics_box.set_margin_top(10);
+    diagnostics_box.set_margin_bottom(10);
+    diagnostics_box.set_margin_start(10);
+    diagnostics_box.set_margin_end(10);
+
+    let diagnostics_header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    diagnostics_header.set_hexpand(true);
+
+    let diagnostics_title_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    diagnostics_title_box.set_hexpand(true);
+    let diagnostics_title = gtk::Label::new(Some("Live health snapshot"));
+    diagnostics_title.set_xalign(0.0);
+    diagnostics_title.add_css_class("heading");
+    diagnostics_title_box.append(&diagnostics_title);
+
+    let diagnostics_updated = gtk::Label::new(Some("Ready"));
+    diagnostics_updated.set_xalign(0.0);
+    diagnostics_updated.add_css_class("diag-muted");
+    diagnostics_title_box.append(&diagnostics_updated);
+    diagnostics_header.append(&diagnostics_title_box);
+
+    let diagnostics_refresh = gtk::Button::with_label("Refresh now");
+    diagnostics_refresh.add_css_class("flat");
+    diagnostics_header.append(&diagnostics_refresh);
+    diagnostics_box.append(&diagnostics_header);
+
+    let diagnostics_scroll = gtk::ScrolledWindow::new();
+    diagnostics_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    diagnostics_scroll.set_hexpand(true);
+    diagnostics_scroll.set_vexpand(true);
+
+    let diagnostics_list = gtk::ListBox::new();
+    diagnostics_list.set_selection_mode(gtk::SelectionMode::None);
+    diagnostics_list.add_css_class("diagnostics-list");
+    populate_diagnostics_list(&diagnostics_list, &view.diagnostics);
+
+    diagnostics_scroll.set_child(Some(&diagnostics_list));
+    diagnostics_box.append(&diagnostics_scroll);
+    diagnostics_frame.set_child(Some(&diagnostics_box));
+
+    let diagnostics_tab_label = gtk::Label::new(Some("Diagnostics"));
+    notebook.append_page(&diagnostics_frame, Some(&diagnostics_tab_label));
+    content.set_end_child(Some(&notebook));
 
     root.append(&content);
     viewport.set_child(Some(&root));
@@ -570,7 +616,111 @@ fn rebuild_window(
         });
     }
 
+    {
+        let shared = shared.clone();
+        let status_label = status_label.clone();
+        let diagnostics_list = diagnostics_list.clone();
+        let diagnostics_updated = diagnostics_updated.clone();
+        diagnostics_refresh.connect_clicked(move |_| {
+            refresh_diagnostics_widgets(
+                &shared,
+                &status_label,
+                &diagnostics_list,
+                &diagnostics_updated,
+                "Updated just now",
+            );
+        });
+    }
+
+    {
+        let shared = shared.clone();
+        let status_label = status_label.clone();
+        let diagnostics_list = diagnostics_list.downgrade();
+        let diagnostics_updated = diagnostics_updated.downgrade();
+        glib::timeout_add_local(std::time::Duration::from_secs(2), move || {
+            let Some(diagnostics_list) = diagnostics_list.upgrade() else {
+                return ControlFlow::Break;
+            };
+            let Some(diagnostics_updated) = diagnostics_updated.upgrade() else {
+                return ControlFlow::Break;
+            };
+
+            refresh_diagnostics_widgets(
+                &shared,
+                &status_label,
+                &diagnostics_list,
+                &diagnostics_updated,
+                "Auto-updated",
+            );
+            ControlFlow::Continue
+        });
+    }
+
     Ok(())
+}
+
+fn refresh_diagnostics_widgets(
+    shared: &SharedState,
+    status_label: &gtk::Label,
+    diagnostics_list: &gtk::ListBox,
+    diagnostics_updated: &gtk::Label,
+    updated_text: &str,
+) {
+    status_label.set_text(&current_status_text(shared));
+    let diagnostics = diagnostics_report(shared).lines;
+    populate_diagnostics_list(diagnostics_list, &diagnostics);
+    diagnostics_updated.set_text(updated_text);
+}
+
+fn populate_diagnostics_list(list: &gtk::ListBox, lines: &[String]) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+
+    for line in lines {
+        let row = gtk::ListBoxRow::new();
+        row.set_activatable(false);
+        row.set_selectable(false);
+
+        let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        row_box.add_css_class("diag-row");
+        row_box.set_margin_top(4);
+        row_box.set_margin_bottom(4);
+        row_box.set_margin_start(4);
+        row_box.set_margin_end(4);
+
+        let (name, value) = line.split_once(": ").unwrap_or(("Info", line.as_str()));
+
+        let name_label = gtk::Label::new(Some(name));
+        name_label.set_xalign(0.0);
+        name_label.set_hexpand(true);
+        name_label.add_css_class("diag-key");
+
+        let value_label = gtk::Label::new(Some(value));
+        value_label.set_xalign(1.0);
+        value_label.set_selectable(true);
+        value_label.set_wrap(true);
+        value_label.add_css_class("diag-value");
+
+        let severity_text = value.to_ascii_lowercase();
+        if severity_text.contains("missing")
+            || severity_text.contains("unavailable")
+            || severity_text.contains("failed")
+            || severity_text.contains("error")
+        {
+            value_label.add_css_class("diag-warn");
+        } else if severity_text.contains("available")
+            || severity_text.contains("enabled")
+            || severity_text.contains("none")
+        {
+            value_label.add_css_class("diag-ok");
+        }
+
+        row_box.append(&name_label);
+        row_box.append(&value_label);
+        row.set_child(Some(&row_box));
+        list.append(&row);
+    }
 }
 
 fn combo_value(combo: Option<&gtk::ComboBoxText>) -> Option<String> {
@@ -659,6 +809,35 @@ fn install_styles() {
         .header-icon-frame {
             padding: 4px;
             background: rgba(27, 79, 114, 0.10);
+        }
+        .diagnostics-card {
+            background: linear-gradient(160deg, rgba(32, 47, 62, 0.10), rgba(32, 47, 62, 0.04));
+        }
+        .diagnostics-list {
+            background: transparent;
+        }
+        .diag-row {
+            border-radius: 10px;
+            background: rgba(32, 47, 62, 0.05);
+        }
+        .diag-key {
+            font-weight: 600;
+            opacity: 0.92;
+        }
+        .diag-value {
+            font-family: Monospace;
+            font-size: 0.92em;
+        }
+        .diag-muted {
+            opacity: 0.72;
+            font-size: 0.9em;
+        }
+        .diag-ok {
+            color: #2e8b57;
+        }
+        .diag-warn {
+            color: #b5533c;
+            font-weight: 600;
         }
         ",
     );

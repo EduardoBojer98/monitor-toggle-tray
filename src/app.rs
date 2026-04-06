@@ -25,6 +25,8 @@ pub const APP_ID: &str = "monitor-toggle-tray";
 pub const APP_NAME: &str = "Monitor Input & Layout Switcher";
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STARTUP_STATUS: &str = "Starting up: refreshing monitor state in the background.";
+const PRIMARY_ONLY_TASK_MANAGER_REFRESH_DELAY: Duration = Duration::from_millis(600);
+const PRIMARY_ONLY_TASK_MANAGER_RETRY_DELAY: Duration = Duration::from_millis(350);
 
 static LAST_COMMAND_FAILURE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
@@ -290,7 +292,7 @@ fn command_timeout(program: &str, args: &[String]) -> Duration {
         "ddcutil" if args.iter().any(|arg| arg == "setvcp") => Duration::from_secs(5),
         "ddcutil" => Duration::from_secs(8),
         "xrandr" | "kscreen-doctor" => Duration::from_secs(5),
-        "qdbus6" => Duration::from_secs(3),
+        "qdbus6" | "qdbus" => Duration::from_secs(3),
         _ => Duration::from_secs(10),
     }
 }
@@ -764,6 +766,7 @@ fn quick_switch_inner(shared: &SharedState) -> Result<QuickSwitchReport, String>
             .iter()
             .map(|layout| layout.name.clone())
             .collect::<Vec<_>>();
+        move_windows_from_outputs_to_primary(&output_names, &primary.output_name);
         log_event(format!(
             "quick_switch: turning controlled monitors off primary={} outputs={}",
             primary.output_name,
@@ -776,7 +779,6 @@ fn quick_switch_inner(shared: &SharedState) -> Result<QuickSwitchReport, String>
         {
             notes.push(format!("layout verification after disable: {err}"));
         }
-        refresh_plasma_task_manager_after_primary_only_switch();
     }
 
     for monitor in &controlled {
@@ -823,6 +825,19 @@ fn quick_switch_inner(shared: &SharedState) -> Result<QuickSwitchReport, String>
         }
     }
 
+    if direction == QuickSwitchState::ControlledMonitorsOff {
+        let output_names = outputs
+            .iter()
+            .map(|layout| layout.name.clone())
+            .collect::<Vec<_>>();
+        if let Err(err) =
+            wait_for_output_activity_state(&output_names, false, Duration::from_secs(3))
+        {
+            notes.push(format!("layout verification after input handoff: {err}"));
+        }
+        repair_plasma_task_manager_after_primary_only_switch();
+    }
+
     if direction == QuickSwitchState::ControlledMonitorsOn {
         let primary_position = config.settings(&primary.id).and_then(|settings| {
             match (settings.saved_position_x, settings.saved_position_y) {
@@ -851,6 +866,7 @@ fn quick_switch_inner(shared: &SharedState) -> Result<QuickSwitchReport, String>
         {
             notes.push(format!("layout verification after restore: {err}"));
         }
+        move_windows_from_primary_to_restored_output(&primary.output_name, &output_names);
     } else {
         log_event("quick_switch: controlled monitors switched away from laptop inputs");
     }
@@ -1366,13 +1382,322 @@ fn parse_current_input(output: &str) -> Option<String> {
     None
 }
 
-fn refresh_plasma_task_manager_after_primary_only_switch() {
-    if !is_kde_wayland_session() {
+fn repair_plasma_task_manager_after_primary_only_switch() {
+    if !is_kde_session() {
         return;
     }
 
-    if !command_exists("qdbus6") {
-        log_event("refresh_plasma_task_manager_after_primary_only_switch: qdbus6 is not available");
+    kwin_reconfigure_screens();
+
+    for (attempt, delay) in [
+        PRIMARY_ONLY_TASK_MANAGER_REFRESH_DELAY,
+        PRIMARY_ONLY_TASK_MANAGER_RETRY_DELAY,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        std::thread::sleep(delay);
+        refresh_plasma_task_manager_after_primary_only_switch();
+        log_event(format!(
+            "repair_plasma_task_manager_after_primary_only_switch: completed refresh pass {}",
+            attempt + 1
+        ));
+    }
+}
+
+fn move_windows_from_outputs_to_primary(source_outputs: &[String], primary_output: &str) {
+    if !is_kde_session() || source_outputs.is_empty() {
+        return;
+    }
+
+    let sources = source_outputs
+        .iter()
+        .map(|output| format!("\"{}\"", js_escape(output)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let target = js_escape(primary_output);
+
+    let script = format!(
+        r#"
+const sourceOutputs = [{sources}];
+const targetOutput = "{target}";
+
+function outputName(window) {{
+    if (!window || !window.output) {{
+        return "";
+    }}
+    if (typeof window.output.name === "string") {{
+        return window.output.name;
+    }}
+    return "";
+}}
+
+function outputGeometry(name) {{
+    if (!workspace || !workspace.outputs) {{
+        return null;
+    }}
+    for (let i = 0; i < workspace.outputs.length; ++i) {{
+        const output = workspace.outputs[i];
+        if (output && output.name === name) {{
+            return output.geometry;
+        }}
+    }}
+    return null;
+}}
+
+const targetGeometry = outputGeometry(targetOutput);
+if (!targetGeometry) {{
+    print("moved-windows=0");
+}} else {{
+    let moved = 0;
+    const windows = workspace.windowList();
+    for (let i = 0; i < windows.length; ++i) {{
+        const window = windows[i];
+        if (!window || window.deleted || window.specialWindow || window.skipTaskbar) {{
+            continue;
+        }}
+
+        const currentOutput = outputName(window);
+        if (sourceOutputs.indexOf(currentOutput) === -1) {{
+            continue;
+        }}
+
+        if (!window.moveable) {{
+            continue;
+        }}
+
+        const current = window.frameGeometry;
+        const width = Math.max(240, Math.min(current.width, targetGeometry.width));
+        const height = Math.max(120, Math.min(current.height, targetGeometry.height));
+        const maxX = targetGeometry.x + targetGeometry.width - width;
+        const maxY = targetGeometry.y + targetGeometry.height - height;
+        const newX = Math.max(targetGeometry.x, Math.min(current.x, maxX));
+        const newY = Math.max(targetGeometry.y, Math.min(current.y, maxY));
+
+        try {{
+            window.frameGeometry = Qt.rect(newX, newY, width, height);
+            ++moved;
+        }} catch (error) {{
+        }}
+    }}
+
+    print("moved-windows=" + moved);
+}}
+"#
+    );
+
+    if let Err(err) = run_kwin_script("move_windows_from_outputs_to_primary", &script) {
+        log_event(format!(
+            "move_windows_from_outputs_to_primary: failed: {err}"
+        ));
+    }
+}
+
+fn move_windows_from_primary_to_restored_output(primary_output: &str, restored_outputs: &[String]) {
+    if !is_kde_session() {
+        return;
+    }
+
+    let Some(target_output) = restored_outputs.first() else {
+        return;
+    };
+
+    let source = js_escape(primary_output);
+    let target = js_escape(target_output);
+
+    let script = format!(
+        r#"
+const sourceOutput = "{source}";
+const targetOutput = "{target}";
+
+function outputName(window) {{
+    if (!window || !window.output) {{
+        return "";
+    }}
+    if (typeof window.output.name === "string") {{
+        return window.output.name;
+    }}
+    return "";
+}}
+
+function outputGeometry(name) {{
+    if (!workspace || !workspace.outputs) {{
+        return null;
+    }}
+    for (let i = 0; i < workspace.outputs.length; ++i) {{
+        const output = workspace.outputs[i];
+        if (output && output.name === name) {{
+            return output.geometry;
+        }}
+    }}
+    return null;
+}}
+
+const targetGeometry = outputGeometry(targetOutput);
+if (!targetGeometry) {{
+    print("moved-windows=0");
+}} else {{
+    let moved = 0;
+    const windows = workspace.windowList();
+    for (let i = 0; i < windows.length; ++i) {{
+        const window = windows[i];
+        if (!window || window.deleted || window.specialWindow || window.skipTaskbar) {{
+            continue;
+        }}
+
+        if (outputName(window) !== sourceOutput) {{
+            continue;
+        }}
+
+        if (!window.moveable) {{
+            continue;
+        }}
+
+        const current = window.frameGeometry;
+        const width = Math.max(240, Math.min(current.width, targetGeometry.width));
+        const height = Math.max(120, Math.min(current.height, targetGeometry.height));
+        const maxX = targetGeometry.x + targetGeometry.width - width;
+        const maxY = targetGeometry.y + targetGeometry.height - height;
+        const newX = Math.max(targetGeometry.x, Math.min(current.x, maxX));
+        const newY = Math.max(targetGeometry.y, Math.min(current.y, maxY));
+
+        try {{
+            window.frameGeometry = Qt.rect(newX, newY, width, height);
+            ++moved;
+        }} catch (error) {{
+        }}
+    }}
+
+    print("moved-windows=" + moved);
+}}
+"#
+    );
+
+    if let Err(err) = run_kwin_script("move_windows_from_primary_to_restored_output", &script) {
+        log_event(format!(
+            "move_windows_from_primary_to_restored_output: failed: {err}"
+        ));
+    }
+}
+
+fn run_kwin_script(action: &str, script: &str) -> Result<(), String> {
+    let script_dir = app_state_dir().join("kwin-scripts");
+    fs::create_dir_all(&script_dir)
+        .map_err(|err| format!("Could not create {}: {err}", script_dir.display()))?;
+
+    let script_file = script_dir.join(format!("{action}.js"));
+    fs::write(&script_file, script)
+        .map_err(|err| format!("Could not write {}: {err}", script_file.display()))?;
+
+    let plugin_name = format!(
+        "monitor_toggle_tray_{}_{}",
+        action,
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0)
+    );
+
+    let mut last_error = "Neither qdbus6 nor qdbus is available.".to_string();
+
+    for program in ["qdbus6", "qdbus"] {
+        if !command_exists(program) {
+            continue;
+        }
+
+        let load_args = vec![
+            "org.kde.KWin".into(),
+            "/Scripting".into(),
+            "org.kde.kwin.Scripting.loadScript".into(),
+            script_file.to_string_lossy().into_owned(),
+            plugin_name.clone(),
+        ];
+
+        let script_id = match run_command(program, &load_args) {
+            Ok(output) => output.trim().to_string(),
+            Err(err) => {
+                last_error = err;
+                continue;
+            }
+        };
+
+        if script_id.is_empty() {
+            last_error = "KWin returned an empty script id.".into();
+            continue;
+        }
+
+        let run_args = vec![
+            "org.kde.KWin".into(),
+            format!("/Scripting/Script{script_id}"),
+            "org.kde.kwin.Script.run".into(),
+        ];
+        let run_result = run_command(program, &run_args);
+
+        let unload_args = vec![
+            "org.kde.KWin".into(),
+            "/Scripting".into(),
+            "org.kde.kwin.Scripting.unloadScript".into(),
+            plugin_name.clone(),
+        ];
+        let _ = run_command(program, &unload_args);
+
+        match run_result {
+            Ok(output) => {
+                let summary = output.trim();
+                if !summary.is_empty() {
+                    log_event(format!("{action}: {summary}"));
+                } else {
+                    log_event(format!("{action}: ok via {program}"));
+                }
+                return Ok(());
+            }
+            Err(err) => {
+                last_error = err;
+            }
+        }
+    }
+
+    Err(last_error)
+}
+
+fn js_escape(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn run_plasma_shell_script(log_prefix: &str, script: &str) -> Result<(), String> {
+    let args = vec![
+        "org.kde.plasmashell".into(),
+        "/PlasmaShell".into(),
+        "org.kde.PlasmaShell.evaluateScript".into(),
+        script.into(),
+    ];
+
+    for program in ["qdbus6", "qdbus"] {
+        if !command_exists(program) {
+            continue;
+        }
+
+        match run_command(program, &args) {
+            Ok(output) => {
+                let summary = output.trim();
+                if !summary.is_empty() {
+                    log_event(format!("{log_prefix}: {summary}"));
+                } else {
+                    log_event(format!("{log_prefix}: ok via {program}"));
+                }
+                return Ok(());
+            }
+            Err(err) => {
+                log_event(format!("{log_prefix}: {program} failed: {err}"));
+            }
+        }
+    }
+
+    Err("Neither qdbus6 nor qdbus is available.".into())
+}
+
+fn refresh_plasma_task_manager_after_primary_only_switch() {
+    if !is_kde_session() {
         return;
     }
 
@@ -1382,81 +1707,97 @@ fn refresh_plasma_task_manager_after_primary_only_switch() {
 
     let script = r#"
 const taskManagerTypes = [
-  "org.kde.plasma.icontasks",
-  "org.kde.plasma.taskmanager"
+    "org.kde.plasma.icontasks",
+    "org.kde.plasma.taskmanager"
 ];
 
 function refreshTaskManagersForContainment(containment) {
-  if (!containment || typeof containment.widgets !== "function") {
-    return 0;
-  }
-
-  let refreshed = 0;
-  const widgets = containment.widgets();
-
-  for (let i = 0; i < widgets.length; ++i) {
-    const widget = widgets[i];
-    if (!widget || taskManagerTypes.indexOf(widget.type) === -1) {
-      continue;
+    if (!containment || typeof containment.widgets !== "function") {
+        return 0;
     }
 
-    if (typeof widget.reloadConfig === "function") {
-      widget.reloadConfig();
-      ++refreshed;
-      continue;
+    let refreshed = 0;
+    const widgets = containment.widgets();
+
+    for (let i = 0; i < widgets.length; ++i) {
+        const widget = widgets[i];
+        if (!widget || taskManagerTypes.indexOf(widget.type) === -1) {
+            continue;
+        }
+
+        if (typeof widget.reloadConfig === "function") {
+            widget.reloadConfig();
+            ++refreshed;
+        }
     }
 
-    if (typeof widget.currentConfigGroup === "function" &&
-        typeof widget.writeConfig === "function" &&
-        typeof widget.readConfig === "function") {
-      const originalGroup = widget.currentConfigGroup();
-      widget.currentConfigGroup = ["General"];
-      const filterByScreen = widget.readConfig("filterByScreen", "");
-      widget.writeConfig("filterByScreen", filterByScreen);
-      widget.currentConfigGroup = originalGroup;
-      ++refreshed;
-    }
-  }
-
-  return refreshed;
+    return refreshed;
 }
 
 let refreshed = 0;
 const plasmaPanels = panels();
 for (let i = 0; i < plasmaPanels.length; ++i) {
-  refreshed += refreshTaskManagersForContainment(plasmaPanels[i]);
+    refreshed += refreshTaskManagersForContainment(plasmaPanels[i]);
 }
 
 const plasmaDesktops = desktops();
 for (let i = 0; i < plasmaDesktops.length; ++i) {
-  refreshed += refreshTaskManagersForContainment(plasmaDesktops[i]);
+    refreshed += refreshTaskManagersForContainment(plasmaDesktops[i]);
 }
 
 print("refreshed-task-managers=" + refreshed);
 "#;
-    let args = vec![
-        "org.kde.plasmashell".into(),
-        "/PlasmaShell".into(),
-        "org.kde.PlasmaShell.evaluateScript".into(),
-        script.into(),
-    ];
 
-    if let Err(err) = run_command("qdbus6", &args) {
+    if let Err(err) = run_plasma_shell_script(
+        "refresh_plasma_task_manager_after_primary_only_switch",
+        script,
+    ) {
         log_event(format!(
             "refresh_plasma_task_manager_after_primary_only_switch: targeted refresh failed: {err}"
         ));
     }
 }
 
-fn is_kde_wayland_session() -> bool {
-    let session_type = env::var("XDG_SESSION_TYPE")
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+fn kwin_reconfigure_screens() {
+    if !is_kde_session() {
+        return;
+    }
+
+    for program in ["qdbus6", "qdbus"] {
+        if !command_exists(program) {
+            continue;
+        }
+
+        let args = vec![
+            "org.kde.KWin".into(),
+            "/KWin".into(),
+            "org.kde.KWin.reconfigure".into(),
+        ];
+
+        match run_command(program, &args) {
+            Ok(_) => {
+                log_event(format!("kwin_reconfigure_screens: ok via {program}"));
+                return;
+            }
+            Err(err) => {
+                log_event(format!("kwin_reconfigure_screens: {program} failed: {err}"));
+            }
+        }
+    }
+}
+
+fn is_kde_session() -> bool {
     let current_desktop = env::var("XDG_CURRENT_DESKTOP")
         .unwrap_or_default()
         .to_ascii_lowercase();
+    let desktop_session = env::var("DESKTOP_SESSION")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
 
-    session_type == "wayland" && current_desktop.contains("kde")
+    current_desktop.contains("kde")
+        || current_desktop.contains("plasma")
+        || desktop_session.contains("kde")
+        || desktop_session.contains("plasma")
 }
 
 fn app_icon_install_dir() -> PathBuf {

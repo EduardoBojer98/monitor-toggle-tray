@@ -1,233 +1,160 @@
 # Monitor Input & Layout Switcher
 
-`monitor-toggle-tray` is a Linux tray app for laptops that share one or more external monitors with another device.
+Monitor Input & Layout Switcher (`monitor-toggle-tray`) is a Linux tray app for quickly handing external monitors between your laptop and another device.
 
-It combines two related jobs in one small tray utility:
+It combines two actions in one click:
 
-- switch a monitor's active input with DDC/CI through `ddcutil`
-- switch the laptop desktop layout with `xrandr` or `kscreen-doctor`
+- switch monitor inputs with DDC/CI (`ddcutil`) when available
+- switch display layout with `kscreen-doctor` / `xrandr`
 
-That makes it useful for setups like:
+Project compatibility names are unchanged:
 
-- one external monitor shared between a work laptop and a desktop PC
-- a laptop dock setup where external displays should be disabled and restored quickly
-- a KDE Plasma or Linux desktop where you want one click from the tray instead of manually changing monitor input and display layout every time
-
-The project name, binary name, config directories, and desktop id remain `monitor-toggle-tray` for compatibility. The user-facing app name shown in the UI is now `Monitor Input & Layout Switcher`.
+- binary: `monitor-toggle-tray`
+- config/state directory: `monitor-toggle-tray`
+- desktop ID: `monitor-toggle-tray`
 
 ## Screenshot
 
-Settings panel:
-
 ![Monitor Input & Layout Switcher settings panel](assets/monitor-toggle-screenshot.png)
 
-## What The App Does
+![Monitor Input & Layout Switcher settings diagnostics](assets/monitor-toggle-screenshot-diagnostics.png)
+## Highlights
 
-When you trigger a quick switch, the app:
+- Tray icon with left-click quick switch
+- Tray menu: `Quick switch now`, `Settings`, `Quit`
+- Dedicated settings window with monitor controls and diagnostics tab
+- Per-monitor quick-switch include toggle
+- Per-monitor `Laptop input` and `Toggle-to input` values
+- `Use Current` helper for capturing current laptop input
+- Save and restore monitor layout
+- Autostart toggle from settings
+- Single-instance protection
+- Debug log file under XDG state directory
 
-1. Detects the currently available monitors.
-2. Finds the built-in or configured primary display.
-3. Finds the external monitors marked for quick switching.
-4. Decides whether it should turn those monitors off for the laptop or bring them back.
-5. Changes each monitor input when DDC/CI input switching is available.
-6. Disables or restores the matching desktop layout.
+## How Quick Switch Works
 
-In practice, that means:
+When you trigger quick switch, the app detects your current state and chooses one of two directions:
 
-- if your selected external monitors are active, the app treats the action as "hand the displays to the other device"
-- if those monitors are inactive, the app treats the action as "bring the displays back to the laptop"
+1. Controlled monitors currently active -> switch away from laptop
+2. Controlled monitors currently inactive -> restore to laptop
 
-## Features
+### Switch away from laptop
 
-- Tray icon with left click to run quick switch immediately
-- Tray menu with `Quick switch now`, `Settings`, and `Quit`
-- Non-blocking startup that refreshes monitor state in the background
-- Dedicated settings window with a responsive split layout
-- Pick the primary display used during quick switching
-- Choose which external monitors are included in quick switch
-- Store `Laptop input` and `Toggle-to input` for each supported monitor
-- Capture the currently detected monitor input with `Use Current`
-- Save the current display layout so external monitors return to the expected position and size
-- Autostart support from inside the settings window
-- Diagnostics section for backend availability and current app state
-- Single-instance protection so only one tray instance runs at a time
-- Background refresh of monitor state
-- Clearer quick-switch summaries that report layout changes, input-switch counts, and any issues
-- Debug log written under the XDG state directory
+- Moves app windows from controlled external outputs to the primary output (KDE sessions)
+- Disables controlled external outputs in the desktop layout
+- Sends monitors to their configured `Toggle-to input` when DDC/CI switching is available
+
+### Restore to laptop
+
+- Sends monitors to their configured `Laptop input` when available
+- Re-enables controlled outputs with saved layout positions/sizes
+- Moves windows back from primary to a restored external output (KDE sessions)
+
+If input switching is unavailable on a monitor, layout switching still runs.
 
 ## Requirements
 
-### Desktop environment
+### Required
 
-- Linux desktop session
-- a tray / status notifier host in your desktop environment
-- at least one connected display
+- Linux desktop session with StatusNotifier/tray host
+- Rust + Cargo (build from source)
+- `xrandr` or `kscreen-doctor` (layout switching)
 
-### Tools
+### Optional but recommended
 
-- Rust and Cargo for building from source
-- `ddcutil` for monitor input detection and switching
-- `xrandr` or `kscreen-doctor` for display layout changes
+- `ddcutil` (input detection/switching)
 
-### Hardware
+### Hardware notes
 
-- for input switching, the monitor must support DDC/CI input control
-- DDC/CI usually must be enabled in the monitor's on-screen menu
-- depending on your distro and hardware, `ddcutil` may need the right permissions for I2C/DDC devices
+- DDC/CI must be supported and enabled per monitor for input switching
+- Some systems require I2C/DDC permissions for non-root `ddcutil`
 
-## Supported Sessions
+## Session And Desktop Notes
 
-Display backend selection is automatic:
+Display backend choice is automatic:
 
-- on Wayland, the app prefers `kscreen-doctor` first and falls back to `xrandr`
-- on X11, the app prefers `xrandr` first and falls back to `kscreen-doctor`
+- Wayland: prefer `kscreen-doctor`, fallback `xrandr`
+- X11: prefer `xrandr`, fallback `kscreen-doctor`
 
-KDE Plasma is supported, including layout capture from `kwinoutputconfig.json` when available.
+KDE Plasma has additional integration:
 
-## TODO
+- window migration during quick switch via KWin scripting
+- improved task-manager refresh behavior after output changes
 
-- investigate support for GNOME and other non-KDE desktop environments, especially tray host compatibility and Wayland display management outside Plasma
-- document which desktop environments are confirmed to work on X11 vs Wayland
-- evaluate whether a non-tray fallback UI is needed for desktops without StatusNotifier support
+The app does not intentionally rewrite your Task Manager behavior options (for example, `From the current screen`).
 
-## Building From Source
+## Build And Run
 
-From the project root:
+From project root:
 
 ```bash
 cargo build
 ```
 
-Useful development commands:
+Run locally:
+
+```bash
+cargo run
+```
+
+Useful dev checks:
 
 ```bash
 cargo check
 cargo test
-cargo run
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-The app uses a single-instance lock. If another instance is already running, a second launch exits instead of creating another tray icon.
+## Install
 
-Startup is intentionally non-blocking. The tray comes up first, then the app refreshes monitor state in the background and updates the status text once detection finishes.
-
-## Quick Start
-
-If you just want to try the app from the source tree:
-
-```bash
-cargo run
-```
-
-If you want it installed into your user profile:
+Install to your user profile:
 
 ```bash
 ./scripts/install.sh
 ```
 
-That installs the binary, desktop launcher, and icon under your user XDG directories.
-
-## Running Without Installing
-
-For local testing:
-
-```bash
-cargo run
-```
-
-This is useful while changing the code or testing monitor behavior before installing the app into your user profile.
-
-## Installation
-
-Install the app into your user profile with:
-
-```bash
-./scripts/install.sh
-```
-
-The installer is user-local only. It does not write to `/usr`, `/usr/local`, or `/opt`.
-
-### Installed Files
+Installed files:
 
 - `~/.local/bin/monitor-toggle-tray`
 - `~/.local/share/applications/monitor-toggle-tray.desktop`
 - `~/.local/share/icons/hicolor/scalable/apps/monitor-toggle-tray.svg`
 
-If the app was already running, the installer stops it, replaces the binary, refreshes the desktop entry and icon caches when possible, and starts it again.
+The installer is user-local only and does not write to system paths like `/usr`.
 
-### Launching After Install
-
-You can launch the app with:
+Launch after install:
 
 ```bash
 monitor-toggle-tray
 ```
 
-or:
+or
 
 ```bash
 ~/.local/bin/monitor-toggle-tray
 ```
 
-It is also available from the application launcher as:
-
-```text
-Monitor Input & Layout Switcher
-```
-
 ## First-Time Setup
 
-After the tray icon appears:
-
 1. Open `Settings` from the tray menu.
-2. Confirm the correct primary display.
-3. For each external monitor you want to control, enable `Include in quick switch`.
-4. Set `Laptop input` for each external monitor that supports DDC/CI input switching.
-5. Set `Toggle-to input` for the input that belongs to the other device.
-6. Arrange your displays the way you want them restored.
-7. Click `Save Current Layout`.
-8. Click `Save Changes`.
+2. Pick your primary display.
+3. Enable `Include in quick switch` on the external monitors you want to control.
+4. Set `Laptop input` and `Toggle-to input` where DDC is available.
+5. Arrange displays as desired.
+6. Click `Save Current Layout`.
+7. Click `Save Changes`.
 
-If the monitor is already on the correct laptop input, you can use `Use Current` to capture it.
+## Settings Overview
 
-## How To Use The App
-
-### Tray usage
-
-- left click the tray icon to run quick switch immediately
-- right click or open the tray menu to access `Quick switch now`, `Settings`, and `Quit`
-
-### Quick switch behavior
-
-If any configured external monitor is active:
-
-- the app disables the controlled external outputs in the laptop layout
-- the app switches those monitors to their `Toggle-to input` when available
-
-If none of the configured external monitors is active:
-
-- the app switches those monitors back to their `Laptop input` when available
-- the app restores the saved display layout
-
-If a monitor does not expose DDC/CI input switching, the app still attempts the desktop layout change and reports the limitation in the result message.
-
-### Settings window
-
-The settings window includes:
+Main controls include:
 
 - primary display selection
 - autostart toggle
-- one section per detected monitor
-- quick-switch inclusion for external monitors
-- `Laptop input` and `Toggle-to input` selectors where DDC/CI input switching is available
-- `Use Current` for capturing the currently detected monitor input as the laptop input
-- `Save Current Layout`
-- `Refresh Monitor State`
-- diagnostics for current app and backend state
-- `Save Changes` and `Reset`
+- monitor cards with input controls
+- layout save/refresh actions
 
-## Configuration And Stored Files
+Diagnostics is available in its own tab and updates live.
 
-The app follows XDG directories.
+## Configuration And Paths
 
 Config file:
 
@@ -253,53 +180,21 @@ Autostart entry:
 ${XDG_CONFIG_HOME:-~/.config}/autostart/monitor-toggle-tray.desktop
 ```
 
-The config stores:
-
-- selected primary monitor id
-- last known quick-switch state
-- per-monitor quick-switch inclusion
-- saved laptop and toggle-to input values
-- saved monitor position and size for layout restore
-
-On KDE Plasma, `Save Current Layout` can also read `kwinoutputconfig.json` to capture positions and sizes for the current active display set.
-
-## Autostart
-
-Autostart is controlled from the settings window and is disabled by default.
-
-When enabled, the app writes a desktop entry to the XDG autostart directory that points to the installed executable path.
-
-If you reinstall later with `./scripts/install.sh`, the installer refreshes that autostart file so it still points at the installed binary.
-
 ## Uninstall
 
-Remove the app with:
+Remove app files from your user profile:
 
 ```bash
 ./scripts/uninstall.sh
 ```
 
-To also remove saved settings and logs:
+Also remove config and state:
 
 ```bash
 ./scripts/uninstall.sh --purge
 ```
 
-The uninstall script:
-
-- stops a running instance if needed
-- removes the binary, launcher, icon, and autostart entry from your user profile
-- keeps the config directory and state directory by default
-- removes the config directory and state directory only when you pass `--purge`
-- refreshes desktop and icon caches when helper tools are available
-
-It does not remove:
-
-- your Rust toolchain
-- repository build artifacts under `target/`
-- system packages such as `ddcutil`, `xrandr`, or `kscreen-doctor`
-
-If you also want to remove build artifacts from the repository:
+Optional cleanup of local build artifacts:
 
 ```bash
 cargo clean
@@ -307,55 +202,28 @@ cargo clean
 
 ## Troubleshooting
 
-If quick switch or monitor detection is not working:
+If switching does not work as expected:
 
-- verify `ddcutil detect --brief` works on your machine
-- verify `ddcutil getvcp 60 --brief` works for the target display
-- verify DDC/CI is enabled in the monitor settings
-- verify `xrandr --query` or `kscreen-doctor -o` works in the current session
-- verify your desktop environment exposes a tray / status notifier host
-- verify the external monitor is physically connected when restoring the laptop layout
-- open `Settings` and check the diagnostics section
-- inspect the debug log at `${XDG_STATE_HOME:-~/.local/state}/monitor-toggle-tray/debug.log`
+- check `ddcutil detect --brief`
+- check `xrandr --query` and/or `kscreen-doctor -o`
+- verify DDC/CI is enabled in monitor OSD
+- verify the tray host is available in your desktop
+- open Settings -> Diagnostics tab
+- check the debug log path listed above
 
-If the tray icon never appears:
+If the tray icon does not appear:
 
-- confirm your desktop environment supports StatusNotifier or tray icons
-- try launching from a terminal with `cargo run` or `~/.local/bin/monitor-toggle-tray`
-- check whether another instance is already running
-
-If the tray app starts but input switching does nothing:
-
-- the monitor may not support DDC/CI input switching
-- the current user may not have permission to access DDC/I2C devices
-- the monitor may expose incomplete DDC capability information
-
-If `ddcutil detect --brief` fails with a permissions error:
-
-- make sure the `i2c-dev` kernel module is available on your system
-- check whether your distro expects an `i2c` group or udev rule for DDC access
-- try `ddcutil detect --brief` manually first before configuring the app
-- if needed, follow your distro's `ddcutil` setup instructions for non-root users
-
-If the layout changes work but the monitor input does not:
-
-- configure the app anyway and rely on layout switching only
-- use `Use Current` to capture the detected laptop input when available
-
-If you are on KDE Plasma and display restoration behaves unexpectedly:
-
-- save the desired layout again with `Save Current Layout`
-- confirm the intended displays are active before saving
-- verify `kscreen-doctor -o` reports the outputs you expect
+- make sure only one instance is running
+- start from terminal to inspect immediate output/log updates
 
 ## Contributing
 
-Issues and improvements are welcome.
+Issues and PRs are welcome.
 
-If you are changing monitor behavior, it helps to include:
+Helpful details in bug reports:
 
-- your desktop session type (`X11` or `Wayland`)
-- your desktop environment
-- the output of `xrandr --query` or `kscreen-doctor -o`
-- whether `ddcutil detect --brief` can see the monitor
-- what you expected the quick switch to do
+- distro and desktop environment
+- session type (`Wayland` or `X11`)
+- output of `xrandr --query` or `kscreen-doctor -o`
+- output of `ddcutil detect --brief`
+- expected vs actual quick-switch behavior
